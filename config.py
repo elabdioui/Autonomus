@@ -56,6 +56,17 @@ class Config:
     REGIME_VOL_MULTIPLIER: float = 2.0
     REGIME_RANGE_MULTIPLIER: float = 0.5
 
+    # S4 SFP params
+    SFP_VOLUME_LOOKBACK: int = 10
+    SFP_VOLUME_FACTOR: float = 1.0
+    OTE_LOW: float = 0.618
+    OTE_HIGH: float = 0.786
+
+    # S3 Bollinger params
+    BB_PERIOD: int = 20
+    BB_STD: float = 2.5
+    S3_SL_MAX_PIPS: float = 15.0  # S3-specific hard cap (stricter than global)
+
     # Pip definition: 1 pip = 0.10 USD price movement on XAUUSD
     PIP: float = 0.10
 
