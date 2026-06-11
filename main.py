@@ -23,6 +23,7 @@ from core.models import Signal
 from core.sessions import get_active_killzone
 from core.store import init_db, insert_signal, upsert_heartbeat
 from execution.engine import try_execute, reconcile_pending_and_orphans
+from execution.manager import manage_open_trades
 from reporting.news_tagger import start_news_updater
 from strategies.base import MarketData
 from strategies.s1_sweep_displacement import SweepDisplacement
@@ -45,10 +46,6 @@ log = logging.getLogger("scalper.main")
 _ALL_STRATEGIES = [SweepDisplacement(), OrbNy(), MeanRevAsia(), SfpAsia()]
 
 
-# ── Management stub (SPEC 4) ──────────────────────────────────────────────────
-def manage_open_positions() -> None:
-    """TP1 partial-close, breakeven, TP2, timeout. Implemented in SPEC 4."""
-    pass
 
 
 # ── Scan job ──────────────────────────────────────────────────────────────────
@@ -66,7 +63,7 @@ def scan_once() -> None:
                           for p in mt5_client.get_positions(m)])
     upsert_heartbeat(open_pos_count, killzone)
     reconcile_pending_and_orphans()
-    manage_open_positions()
+    manage_open_trades()
 
     if killzone is None:
         return   # outside sessions — no scanning

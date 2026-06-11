@@ -6,7 +6,7 @@ TP on MT5 orders = TP2; TP1 is managed in software (partial close in SPEC 4).
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -315,6 +315,23 @@ def get_positions(magic: int | None = None) -> list:
     if positions is None:
         return []
     return [p for p in positions if magic is None or p.magic == magic]
+
+
+def get_tick(symbol: str | None = None):
+    """Return the current tick object (has .bid and .ask). None if unavailable."""
+    if not _MT5_AVAILABLE:
+        return None
+    return mt5.symbol_info_tick(symbol or cfg.SYMBOL)
+
+
+def get_deal_history(position_ticket: int) -> list:
+    """Return all deals associated with a position ticket (last 30 days)."""
+    if not _MT5_AVAILABLE:
+        return []
+    from_date = datetime.now(timezone.utc) - timedelta(days=30)
+    to_date   = datetime.now(timezone.utc) + timedelta(hours=1)
+    deals = mt5.history_deals_get(from_date, to_date, position=position_ticket)
+    return list(deals) if deals is not None else []
 
 
 def get_pending_orders(magic: int | None = None) -> list:

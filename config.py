@@ -67,6 +67,9 @@ class Config:
     BB_STD: float = 2.5
     S3_SL_MAX_PIPS: float = 15.0  # S3-specific hard cap (stricter than global)
 
+    # Friday flat: force-close all positions this many minutes before market close
+    FRIDAY_FLAT_UTC: str = os.getenv("FRIDAY_FLAT_UTC", "21:50")
+
     # Pip definition: 1 pip = 0.10 USD price movement on XAUUSD
     PIP: float = 0.10
 
