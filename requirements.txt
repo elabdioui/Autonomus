@@ -1,0 +1,11 @@
+MetaTrader5
+pandas
+numpy
+python-dotenv
+pytz
+APScheduler
+fastapi
+uvicorn
+openpyxl
+requests
+pytest
