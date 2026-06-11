@@ -24,6 +24,7 @@ from core.sessions import get_active_killzone
 from core.store import init_db, insert_signal, upsert_heartbeat
 from execution.engine import try_execute, reconcile_pending_and_orphans
 from execution.manager import manage_open_trades
+from reporting.excel_export import run_export
 from reporting.news_tagger import start_news_updater
 from strategies.base import MarketData
 from strategies.s1_sweep_displacement import SweepDisplacement
@@ -183,6 +184,8 @@ def main() -> None:
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(scan_once, "interval", seconds=cfg.SCAN_INTERVAL_SECONDS, id="scan")
+    scheduler.add_job(run_export, "cron", hour=22, minute=30, id="daily_export",
+                      timezone="UTC", misfire_grace_time=300)
     log.info("Scheduler started — interval=%ss", cfg.SCAN_INTERVAL_SECONDS)
 
     try:
