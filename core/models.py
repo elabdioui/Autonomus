@@ -47,7 +47,7 @@ class Signal:
 @dataclass
 class TradeRecord:
     trade_id: str
-    signal_id: str
+    signal_id: str | None   # None for crash-recovered positions
     mt5_ticket: int
     strategy: str
     direction: str
