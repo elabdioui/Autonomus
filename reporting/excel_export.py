@@ -55,7 +55,7 @@ def _stats_row(s: TradeStats) -> list:
         round(s.expectancy_pips, 2), _fmt_pf(s.profit_factor),
         round(s.total_pnl_pips, 1), round(s.total_pnl_usd, 2),
         s.exits.get("TP2", 0), s.exits.get("BE", 0),
-        s.exits.get("SL", 0), s.exits.get("TIMEOUT", 0),
+        s.exits.get("SL", 0), s.exits.get("TIMEOUT", 0), s.exits.get("FRIDAY_FLAT", 0),
         round(s.avg_duration_min, 1),
         round(s.avg_mae_winners, 2), round(s.avg_mae_losers, 2),
         round(s.avg_mfe_losers, 2),
@@ -86,7 +86,7 @@ _SUMMARY_COLS = [
     "Strategy", "Count", "Wins", "Losses", "Winrate%",
     "AvgWin", "AvgLoss", "Expectancy", "ProfitFactor",
     "TotalPipsPnl", "TotalUsdPnl",
-    "TP2#", "BE#", "SL#", "Timeout#",
+    "TP2#", "BE#", "SL#", "Timeout#", "FridayFlat#",
     "AvgDurMin", "AvgMAE_Win", "AvgMAE_Loss", "AvgMFE_Loss",
 ]
 

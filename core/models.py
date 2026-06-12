@@ -68,6 +68,8 @@ class TradeRecord:
     news_flag: bool = False
     vol_regime: str = "normal"
     spread_at_entry_pips: float = 0.0
+    be_target: float | None = None   # queued BE price (persisted for crash recovery)
+    be_retries: int = 0              # number of BE-modify attempts so far
 
     def to_row(self) -> dict:
         return {
@@ -93,6 +95,8 @@ class TradeRecord:
             "news_flag": int(self.news_flag),
             "vol_regime": self.vol_regime,
             "spread_at_entry_pips": self.spread_at_entry_pips,
+            "be_target": self.be_target,
+            "be_retries": self.be_retries,
         }
 
     @classmethod
@@ -123,4 +127,6 @@ class TradeRecord:
             news_flag=bool(row["news_flag"]),
             vol_regime=row["vol_regime"] or "normal",
             spread_at_entry_pips=row["spread_at_entry_pips"] or 0.0,
+            be_target=row.get("be_target"),
+            be_retries=row.get("be_retries") or 0,
         )

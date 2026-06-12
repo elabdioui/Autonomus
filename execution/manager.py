@@ -21,9 +21,10 @@ _MAE_MFE_THRESH = 0.5            # min change (pips) before writing MAE/MFE to D
 _DEAL_ENTRY_OUT    = 1           # mt5 DEAL_ENTRY_OUT
 _DEAL_ENTRY_OUT_BY = 3           # mt5 DEAL_ENTRY_OUT_BY
 _EXIT_TOLERANCE_PIPS = 2         # price tolerance for classifying exit reason
+_BE_MAX_RETRIES = 10             # give up BE modify after this many failures
 
-# ── Module-level state (persists across ticks) ────────────────────────────────
-# trade_id → target BE price (queued when modify failed)
+# ── Module-level state (persists across ticks, DB is source of truth) ─────────
+# trade_id → target BE price (in-memory fast path; DB is authoritative)
 _be_pending:  dict[str, float] = {}
 # trade_id → number of BE-modify attempts so far
 _be_retries:  dict[str, int]   = {}
@@ -77,21 +78,13 @@ def _manage_one(trade: TradeRecord, positions: dict, now_utc: datetime) -> None:
     # ── MAE / MFE update ─────────────────────────────────────────────────────
     _update_mae_mfe(trade, tick)
 
-    # ── Retry any pending BE modify ───────────────────────────────────────────
-    if trade.trade_id in _be_pending:
-        _retry_be_modify(trade)
-
     # ── Timeout check ─────────────────────────────────────────────────────────
     if _is_timeout(trade, now_utc):
         result = mt5_client.close_position_full(trade.mt5_ticket)
         if result.success:
-            pnl = _excursion_pips(trade, tick)
-            update_trade(trade.trade_id, status="CLOSED",
-                         exit_reason="TIMEOUT", exit_ts_utc=now_utc,
-                         pnl_pips=round(pnl, 1))
+            _finalize_close(trade, now_utc, "TIMEOUT", fallback_tick=tick)
             insert_event(trade.trade_id, "TIMEOUT_CLOSE",
                          {"ticket": trade.mt5_ticket, "reason": "timeout"})
-            _cleanup(trade.trade_id)
             log.info("TIMEOUT_CLOSE ticket=%d", trade.mt5_ticket)
         else:
             insert_event(trade.trade_id, "CLOSE_FAIL",
@@ -102,14 +95,10 @@ def _manage_one(trade: TradeRecord, positions: dict, now_utc: datetime) -> None:
     if _is_friday_flat(now_utc):
         result = mt5_client.close_position_full(trade.mt5_ticket)
         if result.success:
-            pnl = _excursion_pips(trade, tick)
-            update_trade(trade.trade_id, status="CLOSED",
-                         exit_reason="TIMEOUT", exit_ts_utc=now_utc,
-                         pnl_pips=round(pnl, 1))
-            insert_event(trade.trade_id, "TIMEOUT_CLOSE",
+            _finalize_close(trade, now_utc, "FRIDAY_FLAT", fallback_tick=tick)
+            insert_event(trade.trade_id, "FRIDAY_FLAT_CLOSE",
                          {"ticket": trade.mt5_ticket, "reason": "friday_flat"})
-            _cleanup(trade.trade_id)
-            log.info("FRIDAY_FLAT ticket=%d", trade.mt5_ticket)
+            log.info("FRIDAY_FLAT_CLOSE ticket=%d", trade.mt5_ticket)
         else:
             insert_event(trade.trade_id, "CLOSE_FAIL",
                          {"reason": "friday_flat", "retcode": result.retcode})
@@ -118,6 +107,14 @@ def _manage_one(trade: TradeRecord, positions: dict, now_utc: datetime) -> None:
     # ── TP1 check (OPEN only) ─────────────────────────────────────────────────
     if trade.status == "OPEN":
         _check_tp1(trade, tick)
+        return
+
+    # ── BE retry for PARTIAL trades (in-memory fast path or stateless re-check)
+    if trade.status == "PARTIAL" and trade.sl_current == trade.sl_initial:
+        if trade.trade_id in _be_pending:
+            _retry_be_modify(trade)
+        else:
+            _stateless_be_recheck(trade)
 
 
 # ── TP1 partial + breakeven ───────────────────────────────────────────────────
@@ -153,19 +150,22 @@ def _check_tp1(trade: TradeRecord, tick) -> None:
     if ok:
         insert_event(trade.trade_id, "SL_TO_BE",
                      {"new_sl": be_price, "ticket": trade.mt5_ticket})
-        update_trade(trade.trade_id, status="PARTIAL", sl_current=be_price)
+        update_trade(trade.trade_id, status="PARTIAL", sl_current=be_price,
+                     be_target=None, be_retries=0)
         log.info("SL_TO_BE ticket=%d new_sl=%.2f", trade.mt5_ticket, be_price)
     else:
-        # Queue for retry — mark PARTIAL so we don't try TP1 again
+        # Queue for retry — persist to DB so state survives restart
         _be_pending[trade.trade_id] = be_price
         _be_retries[trade.trade_id] = 1
         insert_event(trade.trade_id, "MODIFY_FAIL",
                      {"attempted_sl": be_price, "retry": 1})
-        update_trade(trade.trade_id, status="PARTIAL")
+        update_trade(trade.trade_id, status="PARTIAL",
+                     be_target=be_price, be_retries=1)
         log.warning("SL-to-BE failed ticket=%d — queued retry 1", trade.mt5_ticket)
 
 
 def _retry_be_modify(trade: TradeRecord) -> None:
+    """Retry a pending BE modify using the in-memory fast path."""
     be_price = _be_pending.get(trade.trade_id)
     if be_price is None:
         return
@@ -176,39 +176,105 @@ def _retry_be_modify(trade: TradeRecord) -> None:
     if ok:
         insert_event(trade.trade_id, "SL_TO_BE",
                      {"new_sl": be_price, "retry": attempt})
-        update_trade(trade.trade_id, sl_current=be_price)
+        update_trade(trade.trade_id, sl_current=be_price, be_target=None, be_retries=0)
         _be_pending.pop(trade.trade_id, None)
         _be_retries.pop(trade.trade_id, None)
         log.info("SL-to-BE retry %d succeeded ticket=%d", attempt, trade.mt5_ticket)
     else:
         _be_retries[trade.trade_id] = attempt
-        insert_event(trade.trade_id, "MODIFY_FAIL",
-                     {"attempted_sl": be_price, "retry": attempt,
-                      "note": "keep_retrying"})
-        log.error("SL-to-BE retry %d failed ticket=%d — retrying next tick",
-                  attempt, trade.mt5_ticket)
+        update_trade(trade.trade_id, be_retries=attempt)
+
+        if attempt >= _BE_MAX_RETRIES:
+            insert_event(trade.trade_id, "BE_GIVEUP",
+                         {"attempted_sl": be_price, "retries": attempt})
+            _be_pending.pop(trade.trade_id, None)
+            _be_retries.pop(trade.trade_id, None)
+            log.error("BE give-up ticket=%d after %d retries", trade.mt5_ticket, attempt)
+        else:
+            insert_event(trade.trade_id, "MODIFY_FAIL",
+                         {"attempted_sl": be_price, "retry": attempt,
+                          "note": "keep_retrying"})
+            log.error("SL-to-BE retry %d failed ticket=%d — retrying next tick",
+                      attempt, trade.mt5_ticket)
 
 
-# ── Exit detection ────────────────────────────────────────────────────────────
+def _stateless_be_recheck(trade: TradeRecord) -> None:
+    """Stateless BE re-check for PARTIAL trades after restart (in-memory dicts empty)."""
+    if trade.be_retries >= _BE_MAX_RETRIES:
+        return  # already gave up
 
-def _handle_exit(trade: TradeRecord, now_utc: datetime) -> None:
-    deals = mt5_client.get_deal_history(trade.mt5_ticket)
-    pnl_pips, pnl_usd = _compute_pnl(trade, deals)
-    exit_price          = _exit_price_from_deals(deals)
-    exit_ts             = _exit_time_from_deals(deals) or now_utc
-    exit_reason         = _classify_exit(trade, exit_price)
+    be_price = trade.be_target
+    if be_price is None:
+        be_price = _be_price(trade)
+        update_trade(trade.trade_id, be_target=be_price, be_retries=0)
+        trade.be_target = be_price
+        trade.be_retries = 0
 
-    update_trade(
-        trade.trade_id,
-        status="CLOSED",
-        exit_reason=exit_reason,
-        exit_ts_utc=exit_ts,
-        pnl_pips=pnl_pips,
-        pnl_usd=pnl_usd,
-    )
+    attempt = trade.be_retries + 1
+    ok = mt5_client.modify_position_sl(trade.mt5_ticket, be_price)
+
+    if ok:
+        insert_event(trade.trade_id, "SL_TO_BE",
+                     {"new_sl": be_price, "retry": attempt})
+        update_trade(trade.trade_id, sl_current=be_price, be_target=None, be_retries=0)
+        log.info("SL-to-BE (stateless recheck) succeeded ticket=%d", trade.mt5_ticket)
+    else:
+        update_trade(trade.trade_id, be_retries=attempt)
+        # Promote to in-memory fast path for subsequent ticks this session
+        _be_pending[trade.trade_id] = be_price
+        _be_retries[trade.trade_id] = attempt
+
+        if attempt >= _BE_MAX_RETRIES:
+            insert_event(trade.trade_id, "BE_GIVEUP",
+                         {"attempted_sl": be_price, "retries": attempt})
+            _be_pending.pop(trade.trade_id, None)
+            _be_retries.pop(trade.trade_id, None)
+            log.error("BE give-up (stateless) ticket=%d after %d retries",
+                      trade.mt5_ticket, attempt)
+        else:
+            insert_event(trade.trade_id, "MODIFY_FAIL",
+                         {"attempted_sl": be_price, "retry": attempt})
+            log.warning("SL-to-BE stateless retry %d failed ticket=%d",
+                        attempt, trade.mt5_ticket)
+
+
+# ── Exit helpers ──────────────────────────────────────────────────────────────
+
+def _finalize_close(trade: TradeRecord, now_utc: datetime, exit_reason: str,
+                    fallback_tick=None, deals=None) -> None:
+    """Write CLOSED status with accurate PnL from deal history.
+
+    If deal history is empty (broker latency), falls back to tick-based pips
+    estimate and leaves pnl_usd NULL. Never raises.
+    """
+    if deals is None:
+        deals = mt5_client.get_deal_history(trade.mt5_ticket)
+
+    if deals:
+        pnl_pips, pnl_usd = _compute_pnl(trade, deals)
+        exit_ts = _exit_time_from_deals(deals) or now_utc
+    else:
+        log.warning("Empty deal history after forced close ticket=%d — pnl_usd unavailable",
+                    trade.mt5_ticket)
+        if fallback_tick is not None:
+            pnl_pips = round(_excursion_pips(trade, fallback_tick), 1)
+        else:
+            pnl_pips = None
+        pnl_usd = None
+        exit_ts = now_utc
+
+    update_trade(trade.trade_id, status="CLOSED", exit_reason=exit_reason,
+                 exit_ts_utc=exit_ts, pnl_pips=pnl_pips, pnl_usd=pnl_usd)
     _cleanup(trade.trade_id)
     log.info("CLOSED ticket=%d reason=%s pnl_pips=%s pnl_usd=%s",
              trade.mt5_ticket, exit_reason, pnl_pips, pnl_usd)
+
+
+def _handle_exit(trade: TradeRecord, now_utc: datetime) -> None:
+    deals = mt5_client.get_deal_history(trade.mt5_ticket)
+    exit_price = _exit_price_from_deals(deals)
+    exit_reason = _classify_exit(trade, exit_price)
+    _finalize_close(trade, now_utc, exit_reason, deals=deals)
 
 
 def _classify_exit(trade: TradeRecord, exit_price: float | None) -> str:
@@ -334,3 +400,4 @@ def _is_friday_flat(now_utc: datetime) -> bool:
 def _cleanup(trade_id: str) -> None:
     _be_pending.pop(trade_id, None)
     _be_retries.pop(trade_id, None)
+    update_trade(trade_id, be_target=None, be_retries=0)

@@ -12,9 +12,21 @@
 | Backend API | NSSM service `xauusd-backend` | session 0, port 8000 |
 | MT5 terminal (signals) | default install `C:\Program Files\...` | logged into signals demo account |
 | NSSM binary | `C:\tools\nssm-2.24-101-g897c7ad\win64\nssm.exe` | reused by dashboard service |
-| Safe-disconnect | `deconnexion_safe.bat` (`tscon`) | must keep working after scalper install |
+| Safe-disconnect | `.\ops\bot.ps1 disconnect` (`tscon`) | must keep working after scalper install |
 
 The scalper runs as a **second, completely independent** process with its own MT5 terminal and demo account. The two bots share the VPS but must never share a terminal or account.
+
+### Isolation contract
+
+| Concern | Signals bot — DO NOT TOUCH | Scalper (this repo) |
+|---------|---------------------------|---------------------|
+| Repo path | `C:\Users\BotVm\Desktop\xauusd\` | `C:\Users\BotVm\Desktop\xauusd-scalper\` |
+| Python process match | cmdline contains `detector` | cmdline contains `xauusd-scalper` AND `main.py` |
+| MT5 terminal | default install path | `C:\MT5_scalper\terminal64.exe` only |
+| Task Scheduler | `xauusd-detector` | `xauusd-scalper` |
+| NSSM services | `xauusd-backend` (port 8000) | `xauusd-scalper-dashboard` (port 8080, optional) |
+| Python env | repo `.venv` | repo `.venv` |
+| DB / logs | inside its repo | `data\`, `logs\` inside this repo |
 
 ---
 
@@ -63,40 +75,31 @@ LOT=0.2
 FINNHUB_API_KEY=<reuse existing key>
 ```
 
-### 1.4 Install Python dependencies
-```powershell
-cd C:\Users\BotVm\Desktop\xauusd-scalper
-pip install -r requirements.txt
-```
-
-### 1.5 Verify MT5 connection before scheduling
-```powershell
-python -c "
-import mt5_client
-assert mt5_client.is_connected(), 'NOT connected'
-import MetaTrader5 as mt5
-info = mt5.account_info()
-print('Login:', info.login, '  Server:', info.server)
-mt5.shutdown()
-"
-```
-Expected output: `Login: 12345678  Server: Exness-MT5Trial`  
-If it prints the **signals bot's** login number, `MT5_TERMINAL_PATH` is wrong — fix `.env`.
-
 ---
 
-## 2. Install Task Scheduler task (scalper main process)
+## 2. Bootstrap (one command — as Administrator)
 
 > Must run as Administrator in an RDP session on botvm.
 
 ```powershell
 cd C:\Users\BotVm\Desktop\xauusd-scalper
-.\scripts\install_task.ps1 -User BotVm -Force
+.\ops\install.ps1
 ```
 
-Verify:
+`install.ps1` does everything in one shot:
+- Verifies Python ≥ 3.11, git, `.env`
+- Creates `.venv` and runs `pip install -r requirements.txt`
+- Validates `MT5_TERMINAL_PATH` points to `C:\MT5_scalper\`
+- Confirms MT5 account identity interactively (abort on wrong account)
+- Registers Task Scheduler task `xauusd-scalper` (AtLogOn BotVm, interactive, RunLevel Highest, restart 1 min ×3)
+- Installs NSSM dashboard service if NSSM present (optional)
+- Runs `.\ops\bot.ps1 status`
+
+Safe to re-run: all steps print `[OK]` or `[SKIP]`, no destructive action on repeat.
+
+Verify afterwards:
 ```powershell
-Get-ScheduledTask -TaskName "xauusd-scalper" | Select-Object TaskName, State
+.\ops\bot.ps1 status
 ```
 
 The task starts automatically at next BotVm logon and restarts on failure (1 min interval, 3 attempts).
@@ -105,10 +108,11 @@ The task starts automatically at next BotVm logon and restarts on failure (1 min
 
 ---
 
-## 3. Install dashboard service (optional)
+## 3. Dashboard service (optional)
 
-```powershell
-.\scripts\install_dashboard_task.ps1   # defaults assume paths above
+Installed automatically by `install.ps1` if NSSM is found at:
+```
+C:\tools\nssm-2.24-101-g897c7ad\win64\nssm.exe
 ```
 
 Access via RDP browser: `http://127.0.0.1:8080`  
@@ -144,71 +148,74 @@ Decision        : 5 s interval / 10 s interval / upgrade
 
 ## 5. Routine operations
 
-### Daily watch (10 seconds)
+### Daily status (10 seconds)
 ```powershell
-.\scripts\watch.ps1
+.\ops\bot.ps1 status
 ```
-Shows: heartbeat age, open positions, today's PnL, last 3 log lines.  
-Prints restart instructions if heartbeat is > 15 min stale.
+Shows: task state, python process, heartbeat age + killzone, open positions, today's PnL, all-time PnL, git HEAD.
 
 ### Update bot (after a git push from dev)
 ```powershell
 # Safe (refuses if position open):
-.\scripts\update_bot.ps1
+.\ops\bot.ps1 update
 
 # Override (use only when position is confirmed safe to interrupt):
-.\scripts\update_bot.ps1 -Force
+.\ops\bot.ps1 update -Force
 ```
 
-### Regenerate Excel journal manually
+### Restart scalper
 ```powershell
-python -m reporting.excel_export
-# Output: data\scalper_journal.xlsx
-```
-Also runs automatically from `main.py` at 22:30 UTC daily.
-
-### Restart scalper manually
-```powershell
-schtasks /End /TN xauusd-scalper
-schtasks /Run /TN xauusd-scalper
+.\ops\bot.ps1 restart
 ```
 
 ### View live logs
 ```powershell
-Get-Content logs\scalper-wrapper.log -Wait -Tail 20
+.\ops\bot.ps1 logs -Wait
 ```
+
+### Key event log grep
+```powershell
+.\ops\bot.ps1 logs stats
+```
+
+### Regenerate Excel journal manually
+```powershell
+.venv\Scripts\python.exe -m reporting.excel_export
+# Output: data\scalper_journal.xlsx
+```
+Also runs automatically from `main.py` at 22:30 UTC daily.
 
 ---
 
 ## 6. deconnexion_safe.bat compatibility
 
-The existing `deconnexion_safe.bat` uses `tscon` to transfer the RDP session to the console — this keeps interactive processes alive (Task Scheduler interactive tasks, MT5 terminals).
+```powershell
+.\ops\bot.ps1 disconnect
+```
 
-After installing the scalper task:
-1. Run `deconnexion_safe.bat` as usual.
-2. Re-RDP into botvm.
-3. Verify both `xauusd-detector` (Task Scheduler) and `xauusd-scalper` (Task Scheduler) are still running:
+Uses `tscon` to transfer the RDP session to the console — keeps interactive processes alive (Task Scheduler interactive tasks, MT5 terminals). One disconnect covers both bots (same Windows session).
 
+After reconnecting, verify both tasks still running:
 ```powershell
 Get-ScheduledTask -TaskName "xauusd-detector","xauusd-scalper" | Select-Object TaskName, State
 ```
 
-Both should show `Running`. If either shows `Ready` (stopped), it was not in the interactive session — check the `LogonType` setting.
+Both should show `Running`. If either shows `Ready` (stopped), the task was not in the interactive session — re-run `install.ps1`.
 
 ---
 
 ## 7. Go-live (demo) checklist
 
 - [ ] `.env` complete, `MT5_TERMINAL_PATH=C:\MT5_scalper\terminal64.exe`
-- [ ] `account_info().login` check passes (scalper demo account, NOT signals account)
-- [ ] Task `xauusd-scalper` installed, state = Running
-- [ ] Survives `deconnexion_safe.bat` disconnect (both tasks still Running after re-RDP)
+- [ ] `install.ps1` ran as Administrator, account identity confirmed
+- [ ] `.\ops\bot.ps1 status` shows `FINAL: OK`
+- [ ] Survives `.\ops\bot.ps1 disconnect` (both tasks still Running after re-RDP)
 - [ ] Inject-test-signal full lifecycle verified on the VPS:
-      `python main.py --inject-test-signal`  → signal in DB → order placed → managed → closed
+      `.venv\Scripts\python.exe main.py --inject-test-signal`  → signal in DB → order placed → managed → closed
 - [ ] Crash-recovery verified (kill python PID with position open → task restarts → reconcile_pending_and_orphans picks up position)
 - [ ] Dashboard reachable at `http://127.0.0.1:8080` via RDP browser
 - [ ] First daily Excel export generated (`data\scalper_journal.xlsx` exists)
-- [ ] Heartbeat row present in DB (watch.ps1 shows `OK`)
+- [ ] Heartbeat row present in DB (`bot.ps1 status` shows `OK`)
 - [ ] Resource check completed (see §4), scan interval decided
 
 **Start date recorded:** ___________  
@@ -222,8 +229,8 @@ Both should show `Running`. If either shows `Ready` (stopped), it was not in the
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `MT5 not connected — skipping tick` | Wrong `MT5_TERMINAL_PATH` or terminal not running | Check `.env`, ensure `C:\MT5_scalper\terminal64.exe` is open and logged in |
-| Task shows `Ready` after logoff | Task registered with wrong logon type | Re-run `install_task.ps1 -Force` |
-| Dashboard 500 / import error | Missing dependency | `pip install -r requirements.txt` |
+| Task shows `Ready` after logoff | Task registered with wrong logon type | Re-run `.\ops\install.ps1` |
+| Dashboard 500 / import error | Missing dependency | `.venv\Scripts\python.exe -m pip install -r requirements.txt` |
 | Two positions open simultaneously | Magic number collision with signals bot | Verify scalper uses 20001–20004 and signals bot uses different magic numbers |
-| Heartbeat stale > 15 min | Bot crashed or hung | `watch.ps1` will print restart command; check `logs\scalper.log` for traceback |
+| Heartbeat stale > 15 min | Bot crashed or hung | `.\ops\bot.ps1 status` shows details; `.\ops\bot.ps1 restart` |
 | `account_info().login` returns signals account | MT5_TERMINAL_PATH still points to default terminal | Set `MT5_TERMINAL_PATH=C:\MT5_scalper\terminal64.exe` in `.env` |

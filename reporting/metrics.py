@@ -12,7 +12,7 @@ import core.store as _store
 
 _STRATEGIES   = ["S1", "S2", "S3", "S4"]
 _KILLZONES    = ["LONDON", "NY_AM", "NY_PM", "ASIA"]
-_EXIT_REASONS = ["TP2", "BE", "SL", "TIMEOUT", "MANUAL"]
+_EXIT_REASONS = ["TP2", "BE", "SL", "TIMEOUT", "FRIDAY_FLAT", "MANUAL"]
 
 
 # ── Output dataclasses ────────────────────────────────────────────────────────

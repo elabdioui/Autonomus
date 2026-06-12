@@ -74,6 +74,15 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     with _conn() as con:
         con.executescript(_DDL)
+        # Idempotent migrations — SQLite has no ADD COLUMN IF NOT EXISTS
+        for stmt in (
+            "ALTER TABLE trades ADD COLUMN be_target REAL",
+            "ALTER TABLE trades ADD COLUMN be_retries INTEGER DEFAULT 0",
+        ):
+            try:
+                con.execute(stmt)
+            except Exception:
+                pass  # column already exists
 
 
 def insert_signal(sig: Signal, status: str = "DETECTED", skip_reason: str | None = None) -> None:
@@ -110,12 +119,14 @@ def insert_trade(trade: TradeRecord) -> None:
                (trade_id, signal_id, mt5_ticket, strategy, direction, lot,
                 entry_price_fill, entry_ts_utc, sl_initial, sl_current, tp1, tp2,
                 status, exit_reason, exit_ts_utc, pnl_pips, pnl_usd,
-                mae_pips, mfe_pips, news_flag, vol_regime, spread_at_entry_pips)
+                mae_pips, mfe_pips, news_flag, vol_regime, spread_at_entry_pips,
+                be_target, be_retries)
                VALUES
                (:trade_id,:signal_id,:mt5_ticket,:strategy,:direction,:lot,
                 :entry_price_fill,:entry_ts_utc,:sl_initial,:sl_current,:tp1,:tp2,
                 :status,:exit_reason,:exit_ts_utc,:pnl_pips,:pnl_usd,
-                :mae_pips,:mfe_pips,:news_flag,:vol_regime,:spread_at_entry_pips)""",
+                :mae_pips,:mfe_pips,:news_flag,:vol_regime,:spread_at_entry_pips,
+                :be_target,:be_retries)""",
             row,
         )
 

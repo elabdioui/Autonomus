@@ -488,7 +488,6 @@ class TestFridayFlat:
 
         # Inject now_utc directly into manager's _manage_one
         import execution.manager as m
-        original = m.manage_open_trades
         def patched_manage():
             trades = [t for t in store.get_open_trades() if t.status in ("OPEN", "PARTIAL")]
             all_pos = {pos.ticket: pos}
@@ -501,7 +500,9 @@ class TestFridayFlat:
         row = _get_trade(trade.trade_id)
         assert row["status"] == "CLOSED"
         events = _get_events(trade.trade_id)
-        assert "TIMEOUT_CLOSE" in events
+        # Fix 1: must use FRIDAY_FLAT_CLOSE, not TIMEOUT_CLOSE
+        assert "FRIDAY_FLAT_CLOSE" in events
+        assert "TIMEOUT_CLOSE" not in events
 
     def test_not_friday_no_forced_close(self, monkeypatch):
         trade = _make_trade("LONG")
@@ -551,3 +552,225 @@ class TestShortTrades:
         be = row["sl_current"]
         # BE for SHORT = entry - 0.5 pip buffer
         assert be == pytest.approx(entry - 0.5 * 0.10, abs=0.01)
+
+
+# ── Fix 1: FRIDAY_FLAT exit reason ────────────────────────────────────────────
+
+class TestFridayFlatExitReason:
+
+    def test_friday_flat_exit_reason_is_friday_flat(self, monkeypatch):
+        """Friday-flat close must write exit_reason=FRIDAY_FLAT, not TIMEOUT."""
+        trade = _make_trade("LONG")
+        pos = FakePos(ticket=trade.mt5_ticket)
+
+        from mt5_client import OrderResult
+        from datetime import date
+        friday = date(2024, 3, 1)
+        flat_time = datetime(friday.year, friday.month, friday.day, 21, 50, tzinfo=timezone.utc)
+
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2000.5, ask=2000.7))
+        monkeypatch.setattr("mt5_client.close_position_full",
+                            lambda ticket: OrderResult(True, ticket=ticket, fill_price=2000.5))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
+
+        import execution.manager as m
+        def patched_manage():
+            trades = [t for t in store.get_open_trades() if t.status in ("OPEN", "PARTIAL")]
+            all_pos = {pos.ticket: pos}
+            for trade_ in trades:
+                m._manage_one(trade_, all_pos, flat_time)
+        monkeypatch.setattr(m, "manage_open_trades", patched_manage)
+        m.manage_open_trades()
+
+        row = _get_trade(trade.trade_id)
+        assert row["exit_reason"] == "FRIDAY_FLAT"
+        events = _get_events(trade.trade_id)
+        assert "FRIDAY_FLAT_CLOSE" in events
+        assert "TIMEOUT_CLOSE" not in events
+
+
+# ── Fix 2: accurate PnL on forced closes ─────────────────────────────────────
+
+class TestFinalizeClosePnl:
+
+    def _out_deals(self, exit_price, entry=2000.0, lot=0.2,
+                   profit=15.0, commission=-0.5) -> list[FakeDeal]:
+        import time as _time
+        now_ts = int(_time.time())
+        return [
+            FakeDeal(ticket=1, entry=0, price=entry, volume=lot, time=now_ts - 120),
+            FakeDeal(ticket=2, entry=1, price=exit_price, volume=lot,
+                     time=now_ts, profit=profit, commission=commission),
+        ]
+
+    def test_timeout_pnl_from_deals(self, monkeypatch):
+        """TIMEOUT close: pnl_pips and pnl_usd come from deal history, not tick excursion."""
+        old_ts = datetime.now(timezone.utc) - timedelta(minutes=cfg.TIMEOUT_MINUTES + 1)
+        trade = _make_trade("LONG", entry=2000.0, entry_ts_utc=old_ts)
+        pos = FakePos(ticket=trade.mt5_ticket)
+
+        from mt5_client import OrderResult
+        exit_price = 2001.5   # 15 pips profit
+        deals = self._out_deals(exit_price, profit=30.0)
+
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2000.1, ask=2000.3))  # tick: 1 pip
+        monkeypatch.setattr("mt5_client.close_position_full",
+                            lambda ticket: OrderResult(True, ticket=ticket, fill_price=exit_price))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: deals)
+
+        manage_open_trades()
+
+        row = _get_trade(trade.trade_id)
+        assert row["status"] == "CLOSED"
+        assert row["exit_reason"] == "TIMEOUT"
+        # PnL must come from deals (15 pips), not tick excursion (1 pip)
+        assert row["pnl_pips"] == pytest.approx(15.0, abs=0.5)
+        assert row["pnl_usd"] == pytest.approx(30.0 - 0.5, abs=0.1)
+
+    def test_timeout_pnl_fallback_when_no_deals(self, monkeypatch):
+        """Empty deal history → excursion fallback, pnl_usd NULL, trade CLOSED."""
+        old_ts = datetime.now(timezone.utc) - timedelta(minutes=cfg.TIMEOUT_MINUTES + 1)
+        trade = _make_trade("LONG", entry=2000.0, entry_ts_utc=old_ts)
+        pos = FakePos(ticket=trade.mt5_ticket)
+
+        from mt5_client import OrderResult
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2002.0, ask=2002.2))  # 20 pips up
+        monkeypatch.setattr("mt5_client.close_position_full",
+                            lambda ticket: OrderResult(True, ticket=ticket, fill_price=2002.0))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
+
+        manage_open_trades()
+
+        row = _get_trade(trade.trade_id)
+        assert row["status"] == "CLOSED"
+        assert row["exit_reason"] == "TIMEOUT"
+        # Fallback: pnl_pips from tick excursion, pnl_usd NULL
+        assert row["pnl_pips"] is not None
+        assert row["pnl_usd"] is None
+
+
+# ── Fix 3: breakeven DB persistence ──────────────────────────────────────────
+
+class TestBeDbPersistence:
+
+    def test_partial_trade_be_recheck_after_restart(self, monkeypatch):
+        """PARTIAL trade with sl_current==sl_initial and be_target=NULL in DB:
+        stateless re-check must call modify_position_sl with the computed BE price."""
+        # Insert PARTIAL trade directly (simulates post-restart: in-memory dicts empty)
+        trade = _make_trade("LONG", status="PARTIAL", entry=2000.0, sl=1998.0,
+                            tp1=2001.0, tp2=2002.0)
+        # sl_current == sl_initial, be_target = NULL (the crash-before-queue scenario)
+        assert mgr._be_pending == {}
+
+        pos = FakePos(ticket=trade.mt5_ticket)
+        modify_calls = []
+
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2001.5, ask=2001.7))
+        monkeypatch.setattr("mt5_client.close_position_full",
+                            lambda ticket: __import__("mt5_client").OrderResult(True, ticket=ticket))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
+
+        def fake_modify(ticket, sl):
+            modify_calls.append(sl)
+            return True
+        monkeypatch.setattr("mt5_client.modify_position_sl", fake_modify)
+
+        manage_open_trades()
+
+        expected_be = round(2000.0 + 0.5 * 0.10, 2)
+        assert any(abs(sl - expected_be) < 0.01 for sl in modify_calls), \
+            f"modify_position_sl not called with BE price. calls={modify_calls}"
+
+        row = _get_trade(trade.trade_id)
+        # After success: be_target should be cleared
+        assert row["be_target"] is None
+        assert row["sl_current"] == pytest.approx(expected_be, abs=0.01)
+
+    def test_be_target_persisted_and_cleared(self, monkeypatch):
+        """Queued BE → be_target set in DB; successful modify → be_target NULL, sl_current updated."""
+        trade = _make_trade("LONG", entry=2000.0, tp1=2001.0, tp2=2002.0)
+        pos = FakePos(ticket=trade.mt5_ticket)
+
+        from mt5_client import OrderResult
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2001.0, ask=2001.2))
+        monkeypatch.setattr("mt5_client.close_position_partial",
+                            lambda ticket, lot: OrderResult(True, ticket=ticket, fill_price=2001.0))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
+
+        # Tick 1: modify fails → be_target written to DB
+        monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: False)
+        manage_open_trades()
+        row = _get_trade(trade.trade_id)
+        expected_be = round(2000.0 + 0.5 * 0.10, 2)
+        assert row["be_target"] == pytest.approx(expected_be, abs=0.01)
+        assert row["be_retries"] >= 1
+
+        # Tick 2: modify succeeds → be_target cleared
+        monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: True)
+        manage_open_trades()
+        row = _get_trade(trade.trade_id)
+        assert row["be_target"] is None
+        assert row["sl_current"] == pytest.approx(expected_be, abs=0.01)
+
+    def test_be_giveup_after_max_retries(self, monkeypatch):
+        """modify always fails → after cap, BE_GIVEUP event once, no further attempts."""
+        from execution.manager import _BE_MAX_RETRIES
+        trade = _make_trade("LONG", entry=2000.0, tp1=2001.0, tp2=2002.0)
+        pos = FakePos(ticket=trade.mt5_ticket)
+
+        from mt5_client import OrderResult
+        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
+        monkeypatch.setattr("mt5_client.get_tick",
+                            lambda symbol=None: FakeTick(bid=2001.0, ask=2001.2))
+        monkeypatch.setattr("mt5_client.close_position_partial",
+                            lambda ticket, lot: OrderResult(True, ticket=ticket, fill_price=2001.0))
+        monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
+        monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: False)
+
+        # Run enough ticks to hit the cap (first tick triggers TP1+queues, rest retry)
+        for _ in range(_BE_MAX_RETRIES + 2):
+            manage_open_trades()
+
+        events = _get_events(trade.trade_id)
+        giveup_events = [e for e in events if e == "BE_GIVEUP"]
+        assert len(giveup_events) == 1, f"Expected exactly 1 BE_GIVEUP, got {len(giveup_events)}"
+
+        # After give-up, further ticks must not call modify_position_sl anymore
+        call_count = {"n": 0}
+        def counting_modify(ticket, sl):
+            call_count["n"] += 1
+            return False
+        monkeypatch.setattr("mt5_client.modify_position_sl", counting_modify)
+        manage_open_trades()
+        assert call_count["n"] == 0, "modify_position_sl called after BE_GIVEUP"
+
+
+# ── Fix 1 + metrics: FRIDAY_FLAT in exits breakdown ──────────────────────────
+
+class TestMetricsFridayFlat:
+
+    def test_metrics_includes_friday_flat(self, monkeypatch):
+        """compute_stats exits breakdown must include FRIDAY_FLAT key."""
+        from reporting.metrics import compute_stats, _EXIT_REASONS
+
+        assert "FRIDAY_FLAT" in _EXIT_REASONS, "_EXIT_REASONS missing FRIDAY_FLAT"
+
+        # Insert a closed FRIDAY_FLAT trade directly
+        trade = _make_trade("LONG", entry=2000.0)
+        store.update_trade(trade.trade_id, status="CLOSED",
+                           exit_reason="FRIDAY_FLAT", pnl_pips=5.0,
+                           exit_ts_utc=datetime.now(timezone.utc))
+
+        stats = compute_stats()
+        assert "FRIDAY_FLAT" in stats.exits
+        assert stats.exits["FRIDAY_FLAT"] == 1
