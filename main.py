@@ -11,6 +11,7 @@ import argparse
 import logging
 import logging.handlers
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,22 +21,23 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 import mt5_client
 from config import cfg
 from core.models import Signal
-from core.sessions import get_active_killzone
+from core.sessions import get_killzone_tag
 from core.store import init_db, insert_signal, upsert_heartbeat
 from execution.engine import try_execute, reconcile_pending_and_orphans
 from execution.manager import manage_open_trades
 from reporting.excel_export import run_export
 from reporting.news_tagger import start_news_updater
 from strategies.base import MarketData
-from strategies.s1_sweep_displacement import SweepDisplacement
-from strategies.s2_orb_ny import OrbNy
-from strategies.s3_meanrev_asia import MeanRevAsia
-from strategies.s4_sfp_asia import SfpAsia
+from strategies.s1_sweep_micro import SETUP as S1
+from strategies.s2_momentum_breakout import SETUP as S2
+from strategies.s3_mean_reversion import SETUP as S3
+from strategies.s4_pullback_continuation import SETUP as S4
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 Path("logs").mkdir(exist_ok=True)
 _fh = logging.handlers.RotatingFileHandler(
-    "logs/scalper.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    "logs/scalper.log", maxBytes=cfg.LOG_MAX_BYTES,
+    backupCount=cfg.LOG_BACKUP_COUNT, encoding="utf-8"
 )
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s"))
 _ch = logging.StreamHandler(sys.stdout)
@@ -44,20 +46,40 @@ logging.basicConfig(level=getattr(logging, cfg.LOG_LEVEL, logging.INFO), handler
 log = logging.getLogger("scalper.main")
 
 # ── Strategy registry ─────────────────────────────────────────────────────────
-_ALL_STRATEGIES = [SweepDisplacement(), OrbNy(), MeanRevAsia(), SfpAsia()]
+_ALL_STRATEGIES = [S1, S2, S3, S4]
+
+_connection_state = True
+_reconnect_failures = 0
+_next_reconnect_at = 0.0
 
 
 
 
 # ── Scan job ──────────────────────────────────────────────────────────────────
 def scan_once() -> None:
+    global _connection_state, _reconnect_failures, _next_reconnect_at
     if not mt5_client.is_connected():
-        log.warning("MT5 disconnected — skipping tick")
+        if _connection_state:
+            log.warning("MT5 state: connected -> disconnected")
+            _connection_state = False
         upsert_heartbeat(0, None)
+        now_mono = time.monotonic()
+        if now_mono >= _next_reconnect_at:
+            if mt5_client.reconnect():
+                _connection_state = True
+                _reconnect_failures = 0
+                _next_reconnect_at = 0.0
+                log.info("MT5 state: disconnected -> reconnected")
+            else:
+                _reconnect_failures += 1
+                delay = min(cfg.MT5_RETRY_BASE_SECONDS * (2 ** (_reconnect_failures - 1)),
+                            cfg.MT5_RETRY_MAX_SECONDS)
+                _next_reconnect_at = now_mono + delay
+                log.warning("MT5 remains disconnected; next reconnect in %.1fs", delay)
         return
 
-    killzone = get_active_killzone()
     now_utc = datetime.now(timezone.utc)
+    killzone = get_killzone_tag(now_utc)
 
     # ── Always: heartbeat + reconcile + manage ────────────────────────────────
     open_pos_count = len([p for m in [20001, 20002, 20003, 20004]
@@ -66,10 +88,7 @@ def scan_once() -> None:
     reconcile_pending_and_orphans()
     manage_open_trades()
 
-    if killzone is None:
-        return   # outside sessions — no scanning
-
-    log.debug("Scan tick — killzone=%s", killzone)
+    log.debug("Scan tick — killzone_tag=%s", killzone)
 
     # ── Fetch OHLC once, shared by all strategies ─────────────────────────────
     tf_data = mt5_client.get_scalper_timeframes()
@@ -87,6 +106,7 @@ def scan_once() -> None:
 
     data = MarketData(
         m1=tf_data["M1"], m5=tf_data["M5"], m15=tf_data["M15"], h1=tf_data["H1"],
+        h4=tf_data["H4"],
         current_price=current_price,
         spread_pips=spread_pips,
         killzone=killzone,
@@ -95,30 +115,20 @@ def scan_once() -> None:
 
     # ── Run strategies ────────────────────────────────────────────────────────
     for strat in _ALL_STRATEGIES:
-        if strat.id not in cfg.ENABLED_STRATEGIES:
-            continue
-        if killzone not in strat.sessions:
-            continue
-
         for direction in ("LONG", "SHORT"):
             try:
                 sig = strat.scan(data, direction)
             except Exception as exc:
-                log.error("Strategy %s/%s error: %s", strat.id, direction, exc, exc_info=True)
+                log.error("Strategy %s/%s error: %s", strat.name, direction, exc, exc_info=True)
                 continue
 
             if sig is None:
                 continue
 
-            if sig.sl_pips > cfg.SL_MAX_PIPS:
-                insert_signal(sig, status="SKIPPED_SL_TOO_WIDE",
-                              skip_reason=f"sl_pips={sig.sl_pips:.1f}")
-                log.info("SKIPPED_SL_TOO_WIDE %s %s sl=%.1f pips", strat.id, direction, sig.sl_pips)
-            else:
-                insert_signal(sig, status="DETECTED")
-                log.info("DETECTED %s %s entry=%.2f sl=%.2f score=%d",
-                         strat.id, direction, sig.entry_price, sig.sl, sig.score)
-                try_execute(sig)
+            insert_signal(sig, status="DETECTED")
+            log.info("DETECTED %s %s entry=%.3f structural_sl=%.1fp score=%d",
+                     strat.name, direction, sig.entry_price, sig.sl_pips, sig.score)
+            try_execute(sig)
 
 
 # ── Test signal injection ─────────────────────────────────────────────────────
@@ -134,14 +144,15 @@ def _inject_test_signal() -> None:
         return
 
     spread = mt5_client.get_spread_pips()
-    sl = round(tick - 2.0, 2)   # 20 pips SL for test
-    tp1 = round(tick + 1.0, 2)
-    tp2 = round(tick + 2.0, 2)
+    sl = round(tick - 20 * cfg.PIP, cfg.DIGITS)
+    tp1 = round(tick + cfg.TP1_PIPS * cfg.PIP, cfg.DIGITS)
+    tp2 = round(tick + cfg.TP2_PIPS * cfg.PIP, cfg.DIGITS)
 
     sig = Signal(
         signal_id=uuid.uuid4().hex,
         ts_utc=datetime.now(timezone.utc),
         strategy="S1",
+        setup="S1_sweep_micro",
         direction="LONG",
         killzone="LONDON",
         entry_type="MARKET",
@@ -171,7 +182,7 @@ def main() -> None:
     args = parser.parse_args()
 
     log.info("xauusd-scalper starting — symbol=%s lot=%s strategies=%s",
-             cfg.SYMBOL, cfg.LOT, cfg.ENABLED_STRATEGIES)
+             cfg.SYMBOL, cfg.LOT, [setup.name for setup in _ALL_STRATEGIES])
 
     init_db()
     mt5_client.connect()
