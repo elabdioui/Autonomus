@@ -43,10 +43,10 @@ class SignalFunnel:
     total_signals: int        = 0
     detected: int             = 0
     executed: int             = 0
-    skipped_sl_too_wide: int  = 0
     skipped_position_open: int = 0
     skipped_cooldown: int     = 0
     skipped_spread: int       = 0
+    skipped_sl_too_wide: int  = 0
     skipped_order_rejected: int = 0
 
 
@@ -152,7 +152,8 @@ def compute_stats(**filters) -> TradeStats:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
 
     total_pnl_pips = sum(r["pnl_pips"] for r in rows)
-    total_pnl_usd  = sum((r["pnl_usd"] or 0) for r in rows)
+    total_pnl_usd  = sum((r["pnl_net_usd"] if r["pnl_net_usd"] is not None
+                          else (r["pnl_usd"] or 0)) for r in rows)
 
     exits = {r: sum(1 for t in rows if t["exit_reason"] == r) for r in _EXIT_REASONS}
     exits_pct = {r: exits[r] / count for r in _EXIT_REASONS}
@@ -201,10 +202,10 @@ def compute_funnel(strategy: str | None = None) -> list[SignalFunnel]:
             total_signals=sum(c.values()),
             detected=c.get("DETECTED", 0),
             executed=c.get("EXECUTED", 0),
-            skipped_sl_too_wide=c.get("SKIPPED_SL_TOO_WIDE", 0),
             skipped_position_open=c.get("SKIPPED_POSITION_OPEN", 0),
             skipped_cooldown=c.get("SKIPPED_COOLDOWN", 0),
             skipped_spread=c.get("SKIPPED_SPREAD", 0),
+            skipped_sl_too_wide=c.get("SKIPPED_SL_TOO_WIDE", 0),
             skipped_order_rejected=c.get("SKIPPED_ORDER_REJECTED", 0),
         ))
 

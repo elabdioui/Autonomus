@@ -18,7 +18,7 @@ from reporting.news_tagger import is_red_news_window
 log = logging.getLogger(__name__)
 
 ALL_MAGICS = [20001, 20002, 20003, 20004]
-_PIP = 0.10
+_PIP = cfg.PIP
 _MAGIC_TO_STRATEGY = {20001: "S1", 20002: "S2", 20003: "S3", 20004: "S4"}
 _STRATEGY_TO_MAGIC = {v: k for k, v in _MAGIC_TO_STRATEGY.items()}
 
@@ -59,6 +59,29 @@ def _vol_regime_now() -> str:
     return "normal"
 
 
+def _execution_levels(signal: Signal) -> tuple[float, float, float] | None:
+    """Return entry reference, fixed 20-pip SL and valid TP for execution."""
+    if signal.entry_type == "MARKET":
+        tick = mt5_client.get_tick()
+        if tick is None:
+            # place_market validates again against the live executable bid/ask.
+            entry = signal.entry_price
+            log.warning("No preflight tick for %s %s; using signal entry %.3f",
+                        signal.strategy, signal.direction, entry)
+        else:
+            entry = tick.ask if signal.direction == "LONG" else tick.bid
+    else:
+        entry = signal.entry_price
+    risk = cfg.SL_MAX_PIPS * cfg.PIP
+    if signal.direction == "LONG":
+        sl = entry - risk
+        tp = signal.tp2 if signal.tp2 > entry else entry + cfg.TP2_PIPS * cfg.PIP
+    else:
+        sl = entry + risk
+        tp = signal.tp2 if signal.tp2 < entry else entry - cfg.TP2_PIPS * cfg.PIP
+    return round(entry, cfg.DIGITS), round(sl, cfg.DIGITS), round(tp, cfg.DIGITS)
+
+
 # ── Gate sequence + order placement ──────────────────────────────────────────
 
 def try_execute(signal: Signal) -> None:
@@ -78,33 +101,24 @@ def try_execute(signal: Signal) -> None:
             return
         log.info("Reconnect succeeded")
 
-    # ── Gate 1: Position / pending gate ──────────────────────────────────────
+    # Measurement tags. Only the high runaway ceiling remains a hard gate.
     active_positions = [p for m in ALL_MAGICS for p in mt5_client.get_positions(m)]
     active_orders    = [o for m in ALL_MAGICS for o in mt5_client.get_pending_orders(m)]
-    if active_positions or active_orders:
+    would_block_position = bool(active_positions or active_orders)
+    if len(active_positions) + len(active_orders) >= cfg.MAX_OPEN_POSITIONS:
         update_signal_status(
-            signal.signal_id, "SKIPPED_POSITION_OPEN",
-            f"pos={len(active_positions)} pend={len(active_orders)}",
+            signal.signal_id, "SKIPPED_RUNAWAY_LIMIT",
+            f"active={len(active_positions) + len(active_orders)} limit={cfg.MAX_OPEN_POSITIONS}",
         )
+        log.critical("RUNAWAY_LIMIT signal=%s active=%d limit=%d",
+                     signal.signal_id[:8], len(active_positions) + len(active_orders),
+                     cfg.MAX_OPEN_POSITIONS)
         return
 
-    # ── Gate 2: Cooldown ──────────────────────────────────────────────────────
-    if not _cooldown_ok(signal.strategy, signal.direction):
-        update_signal_status(signal.signal_id, "SKIPPED_COOLDOWN",
-                             f"cooldown={cfg.COOLDOWN_MINUTES}min")
-        return
+    would_block_cooldown = not _cooldown_ok(signal.strategy, signal.direction)
 
-    # ── Gate 3: Spread ────────────────────────────────────────────────────────
     spread = mt5_client.get_spread_pips()
-    if spread > cfg.MAX_SPREAD_PIPS:
-        update_signal_status(signal.signal_id, "SKIPPED_SPREAD", f"spread={spread:.1f}")
-        return
-
-    # ── Gate 4: SL width (double-check) ──────────────────────────────────────
-    if signal.sl_pips > cfg.SL_MAX_PIPS:
-        update_signal_status(signal.signal_id, "SKIPPED_SL_TOO_WIDE",
-                             f"sl_pips={signal.sl_pips:.1f}")
-        return
+    would_block_spread = spread > cfg.MAX_SPREAD_PIPS
 
     # ── News tagging (non-blocking) ───────────────────────────────────────────
     now_utc = datetime.now(timezone.utc)
@@ -118,13 +132,23 @@ def try_execute(signal: Signal) -> None:
     # ── Place order ───────────────────────────────────────────────────────────
     comment = _make_comment(signal.strategy, signal.signal_id)
     magic = _STRATEGY_TO_MAGIC.get(signal.strategy, 20001)
+    levels = _execution_levels(signal)
+    if levels is None:
+        update_signal_status(signal.signal_id, "SKIPPED_ORDER_REJECTED", "NO_TICK_FOR_STOPS")
+        return
+    execution_entry, execution_sl, execution_tp = levels
+    execution_tp1 = round(
+        execution_entry + (cfg.TP1_PIPS * cfg.PIP if signal.direction == "LONG"
+                           else -cfg.TP1_PIPS * cfg.PIP),
+        cfg.DIGITS,
+    )
 
     if signal.entry_type == "MARKET":
         result = mt5_client.place_market(
             direction=signal.direction,
             lot=cfg.LOT,
-            sl=signal.sl,
-            tp=signal.tp2,   # TP2 on MT5; TP1 managed in software
+            sl=execution_sl,
+            tp=execution_tp,
             magic=magic,
             comment=comment,
         )
@@ -132,10 +156,10 @@ def try_execute(signal: Signal) -> None:
         expiry = now_utc + timedelta(minutes=cfg.PENDING_ORDER_EXPIRY_MIN)
         result = mt5_client.place_limit(
             direction=signal.direction,
-            price=signal.entry_price,
+            price=execution_entry,
             lot=cfg.LOT,
-            sl=signal.sl,
-            tp=signal.tp2,
+            sl=execution_sl,
+            tp=execution_tp,
             magic=magic,
             comment=comment,
             expiry_utc=expiry,
@@ -150,7 +174,7 @@ def try_execute(signal: Signal) -> None:
 
     # ── Write trade record ────────────────────────────────────────────────────
     trade_id = uuid.uuid4().hex
-    fill_price = result.fill_price or signal.entry_price
+    fill_price = result.fill_price or execution_entry
     status = "OPEN" if signal.entry_type == "MARKET" else "PENDING"
     event_name = "FILLED" if status == "OPEN" else "PLACED"
 
@@ -163,14 +187,19 @@ def try_execute(signal: Signal) -> None:
         lot=cfg.LOT,
         entry_price_fill=fill_price,
         entry_ts_utc=now_utc,
-        sl_initial=signal.sl,
-        sl_current=signal.sl,
-        tp1=signal.tp1,
-        tp2=signal.tp2,
+        sl_initial=execution_sl,
+        sl_current=execution_sl,
+        tp1=execution_tp1,
+        tp2=execution_tp,
         status=status,
         news_flag=news_flag,
         vol_regime=vol_regime,
         spread_at_entry_pips=spread,
+        sl_structural_pips=signal.sl_pips,
+        would_block_position=would_block_position,
+        would_block_cooldown=would_block_cooldown,
+        would_block_news=news_flag,
+        would_block_spread=would_block_spread,
     )
     insert_trade(trade)
     update_signal_status(signal.signal_id, "EXECUTED")
@@ -180,11 +209,17 @@ def try_execute(signal: Signal) -> None:
         "spread_pips": spread,
         "news_flag": news_flag,
         "news_known": news_known,
+        "sl_structural_pips": signal.sl_pips,
+        "sl_executed_pips": cfg.SL_MAX_PIPS,
+        "would_block_position": would_block_position,
+        "would_block_cooldown": would_block_cooldown,
+        "would_block_news": news_flag,
+        "would_block_spread": would_block_spread,
     })
 
     log.info("%s %s %s ticket=%s entry=%.2f sl=%.2f tp1=%.2f tp2=%.2f spread=%.1f",
              event_name, signal.strategy, signal.direction, result.ticket,
-             fill_price, signal.sl, signal.tp1, signal.tp2, spread)
+             fill_price, execution_sl, execution_tp1, execution_tp, spread)
 
 
 # ── Pending order lifecycle + orphan recovery ─────────────────────────────────

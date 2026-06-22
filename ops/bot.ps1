@@ -30,6 +30,7 @@ $LogWrapper  = Join-Path $Root "logs\scalper-wrapper.log"
 $LogScalper  = Join-Path $Root "logs\scalper.log"
 $BatPath     = Join-Path $Root "scripts\start_scalper.bat"
 $Python      = Join-Path $Root ".venv\Scripts\python.exe"
+$DbStatusPy  = Join-Path $PSScriptRoot "db_status.py"
 $TaskName    = "xauusd-scalper"
 $SvcName     = "xauusd-scalper-dashboard"
 $MT5Path     = "C:\MT5_scalper\terminal64.exe"   # configurable — MUST stay under C:\MT5_scalper\
@@ -103,51 +104,6 @@ function Start-Dashboard {
     Write-OK "Dashboard service started."
 }
 
-# ── DB stats inline python ────────────────────────────────────────────────────
-$PyDbScript = @'
-import sqlite3, sys
-from datetime import datetime, timezone
-
-db  = sys.argv[1]
-con = sqlite3.connect(db, timeout=5)
-
-open_pos = con.execute(
-    "SELECT COUNT(*) FROM trades WHERE status IN ('OPEN','PARTIAL')"
-).fetchone()[0]
-
-today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-row   = con.execute(
-    "SELECT COUNT(*), COALESCE(SUM(pnl_pips),0), COALESCE(SUM(pnl_usd),0) "
-    "FROM trades WHERE status='CLOSED' AND exit_ts_utc LIKE ?",
-    (today + '%',)
-).fetchone()
-today_cnt, today_pips, today_usd = row
-
-total = con.execute(
-    "SELECT COUNT(*), COALESCE(SUM(pnl_pips),0) FROM trades WHERE status='CLOSED'"
-).fetchone()
-total_cnt, total_pips = total
-
-hb = con.execute(
-    "SELECT ts_utc, open_positions, last_scan_killzone FROM heartbeat WHERE id=1"
-).fetchone()
-con.close()
-
-print(f"open_pos={open_pos}")
-print(f"today={today_cnt},{today_pips:.1f},{today_usd:.2f}")
-print(f"total={total_cnt},{total_pips:.1f}")
-if hb:
-    ts = datetime.fromisoformat(hb[0])
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-    kz      = hb[2] or "NONE"
-    status  = "OK" if age_min < 2 else ("WARN" if age_min < 15 else "STALE")
-    print(f"hb={status},{age_min:.1f},{kz},{hb[1]}")
-else:
-    print("hb=NONE")
-'@
-
 $PyOpenCount = @'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1], timeout=5)
@@ -203,15 +159,19 @@ function Invoke-Status {
     } elseif (-not (Test-Path $Python)) {
         Write-WARN "Venv python not found ($Python) — skipping DB query."
     } else {
-        $raw = & $Python -c $PyDbScript $DB 2>&1
+        $raw = & $Python $DbStatusPy $DB 2>&1
         $hbFail = $false
         foreach ($line in $raw) {
-            if ($line -match "^open_pos=(.+)") {
+            if ($line -match "^db=UNINITIALIZED,(.+)") {
+                Write-WARN "Database schema       : not initialized ($($Matches[1]))"
+            } elseif ($line -match "^open_pos=(.+)") {
                 Write-INFO "Open/partial positions : $($Matches[1])"
             } elseif ($line -match "^today=(\d+),([\d.\-]+),([\d.\-]+)") {
                 Write-INFO "Today trades           : $($Matches[1])  pnl=$($Matches[2]) pips  ($($Matches[3]) USD)"
             } elseif ($line -match "^total=(\d+),([\d.\-]+)") {
                 Write-INFO "All-time trades        : $($Matches[1])  pnl=$($Matches[2]) pips"
+            } elseif ($line -match "^recent=([^,]+),([^,]+),([^,]+),([\d.\-]+)") {
+                Write-INFO "Recent trade           : $($Matches[1]) $($Matches[2]) $($Matches[3]) pnl=$($Matches[4])p"
             } elseif ($line -match "^hb=NONE") {
                 Write-WARN "Heartbeat              : NO ENTRY — bot has not written a heartbeat yet"
                 $hbFail = $true ; $ok = $false

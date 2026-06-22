@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.sessions import get_active_killzone, is_in_killzone, _in_window
+from core.sessions import get_active_killzone, get_killzone_tag, is_in_killzone, _in_window
 
 
 class TestInWindow:
@@ -60,6 +60,7 @@ class TestGetActiveKillzone:
     def test_dead_zone(self):
         # Between sessions (e.g. 11:00 UTC)
         assert get_active_killzone(_utc(11)) is None
+        assert get_killzone_tag(_utc(11)) == "OFF"
 
     def test_is_in_killzone(self):
         assert is_in_killzone(_utc(8)) is True

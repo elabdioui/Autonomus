@@ -125,7 +125,9 @@ def _sheet_trades(wb: Workbook) -> None:
         "SlInitial", "SlCurrent", "Tp1", "Tp2",
         "Status", "ExitReason",
         "PnlPips", "PnlUsd", "MaePips", "MfePips",
-        "NewsFlag", "VolRegime", "SpreadEntry",
+        "NewsFlag", "VolRegime", "SpreadEntry", "SlStructuralPips",
+        "WouldBlockPosition", "WouldBlockCooldown", "WouldBlockNews", "WouldBlockSpread",
+        "GrossUsd", "CommissionUsd", "SwapUsd", "NetUsd",
     ]
     _h(ws, 1, cols)
 
@@ -151,6 +153,10 @@ def _sheet_trades(wb: Workbook) -> None:
             r["pnl_pips"], r["pnl_usd"],
             r["mae_pips"], r["mfe_pips"],
             bool(r["news_flag"]), r["vol_regime"], r["spread_at_entry_pips"],
+            r["sl_structural_pips"], bool(r["would_block_position"]),
+            bool(r["would_block_cooldown"]), bool(r["would_block_news"]),
+            bool(r["would_block_spread"]), r["pnl_gross_usd"],
+            r["commission_usd"], r["swap_usd"], r["pnl_net_usd"],
         ])
 
     _auto_width(ws)
@@ -197,14 +203,14 @@ def _sheet_funnel(wb: Workbook) -> None:
     ws = wb.create_sheet("Funnel")
     cols = [
         "Strategy", "TotalSignals", "Detected", "Executed",
-        "Skip_SL", "Skip_PosOpen", "Skip_Cooldown", "Skip_Spread", "Skip_Rejected",
+        "Skip_PosOpen", "Skip_Cooldown", "Skip_Spread", "Skip_Rejected",
     ]
     _h(ws, 1, cols)
 
     for f in compute_funnel():
         ws.append([
             f.strategy, f.total_signals, f.detected, f.executed,
-            f.skipped_sl_too_wide, f.skipped_position_open,
+            f.skipped_position_open,
             f.skipped_cooldown, f.skipped_spread, f.skipped_order_rejected,
         ])
 

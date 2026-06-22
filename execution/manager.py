@@ -14,7 +14,7 @@ from core.store import get_open_trades, update_trade, insert_event
 
 log = logging.getLogger(__name__)
 
-_PIP = 0.10
+_PIP = cfg.PIP
 _ALL_MAGICS = [20001, 20002, 20003, 20004]
 _BE_BUFFER_PIPS = 0.5            # SL placed this far in-profit from entry at BE move
 _MAE_MFE_THRESH = 0.5            # min change (pips) before writing MAE/MFE to DB
@@ -120,7 +120,7 @@ def _manage_one(trade: TradeRecord, positions: dict, now_utc: datetime) -> None:
 # ── TP1 partial + breakeven ───────────────────────────────────────────────────
 
 def _check_tp1(trade: TradeRecord, tick) -> None:
-    tp1_pips = cfg.S3_TP1_PIPS if trade.strategy == "S3" else cfg.TP1_PIPS
+    tp1_pips = cfg.TP1_PIPS
     if _excursion_pips(trade, tick) < tp1_pips:
         return
 
@@ -252,6 +252,10 @@ def _finalize_close(trade: TradeRecord, now_utc: datetime, exit_reason: str,
 
     if deals:
         pnl_pips, pnl_usd = _compute_pnl(trade, deals)
+        pnl_gross_usd = round(sum(float(getattr(d, "profit", 0.0)) for d in deals), 2)
+        commission_signed = round(sum(float(getattr(d, "commission", 0.0)) for d in deals), 2)
+        swap_usd = round(sum(float(getattr(d, "swap", 0.0)) for d in deals), 2)
+        commission_usd = round(-commission_signed, 2)
         exit_ts = _exit_time_from_deals(deals) or now_utc
     else:
         log.warning("Empty deal history after forced close ticket=%d — pnl_usd unavailable",
@@ -261,10 +265,15 @@ def _finalize_close(trade: TradeRecord, now_utc: datetime, exit_reason: str,
         else:
             pnl_pips = None
         pnl_usd = None
+        pnl_gross_usd = None
+        commission_usd = 0.0
+        swap_usd = 0.0
         exit_ts = now_utc
 
     update_trade(trade.trade_id, status="CLOSED", exit_reason=exit_reason,
-                 exit_ts_utc=exit_ts, pnl_pips=pnl_pips, pnl_usd=pnl_usd)
+                 exit_ts_utc=exit_ts, pnl_pips=pnl_pips, pnl_usd=pnl_usd,
+                 pnl_gross_usd=pnl_gross_usd, commission_usd=commission_usd,
+                 swap_usd=swap_usd, pnl_net_usd=pnl_usd)
     _cleanup(trade.trade_id)
     log.info("CLOSED ticket=%d reason=%s pnl_pips=%s pnl_usd=%s",
              trade.mt5_ticket, exit_reason, pnl_pips, pnl_usd)
@@ -379,8 +388,8 @@ def _excursion_pips(trade: TradeRecord, tick) -> float:
 def _be_price(trade: TradeRecord) -> float:
     buf = _BE_BUFFER_PIPS * _PIP
     if trade.direction == "LONG":
-        return round(trade.entry_price_fill + buf, 2)
-    return round(trade.entry_price_fill - buf, 2)
+        return round(trade.entry_price_fill + buf, cfg.DIGITS)
+    return round(trade.entry_price_fill - buf, cfg.DIGITS)
 
 
 def _is_timeout(trade: TradeRecord, now_utc: datetime) -> bool:

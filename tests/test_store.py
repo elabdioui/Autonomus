@@ -26,6 +26,7 @@ def _sig() -> Signal:
         signal_id=uuid.uuid4().hex,
         ts_utc=datetime(2024, 3, 1, 10, 0, tzinfo=timezone.utc),
         strategy="S1",
+        setup="S1_sweep_micro",
         direction="LONG",
         killzone="LONDON",
         entry_type="MARKET",
@@ -71,6 +72,7 @@ class TestSignalRoundTrip:
         row = con.execute("SELECT * FROM signals WHERE signal_id=?", (sig.signal_id,)).fetchone()
         assert row is not None
         assert row["strategy"] == "S1"
+        assert row["setup"] == "S1_sweep_micro"
         assert row["direction"] == "LONG"
         assert row["status"] == "DETECTED"
         assert json.loads(row["confluences"]) == ["Sweep", "FVG_M5"]

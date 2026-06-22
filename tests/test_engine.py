@@ -131,64 +131,31 @@ class TestHelpers:
 
 class TestGates:
 
-    def test_gate1_position_open_skipped(self, monkeypatch):
+    def test_contextual_conditions_are_recorded_not_gated(self, monkeypatch):
         fake_pos = MagicMock(); fake_pos.magic = 20001
         monkeypatch.setattr("mt5_client.is_connected", lambda: True)
         monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [fake_pos])
         monkeypatch.setattr("mt5_client.get_pending_orders", lambda magic=None: [])
-        monkeypatch.setattr("mt5_client.get_spread_pips", lambda symbol=None: 1.5)
-
-        sig = _sig()
-        store.insert_signal(sig)
-        try_execute(sig)
-        status = sqlite3.connect(store.DB_PATH).execute(
-            "SELECT status FROM signals WHERE signal_id=?", (sig.signal_id,)
-        ).fetchone()[0]
-        assert status == "SKIPPED_POSITION_OPEN"
-
-    def test_gate2_cooldown_skipped(self, mt5_connected, monkeypatch):
-        # Insert a recent closed trade for S1 LONG
-        sig0 = _sig(); store.insert_signal(sig0)
-        t = TradeRecord(
-            trade_id=uuid.uuid4().hex, signal_id=sig0.signal_id, mt5_ticket=1,
-            strategy="S1", direction="LONG", lot=0.2, entry_price_fill=2000.0,
-            entry_ts_utc=datetime.now(timezone.utc), sl_initial=1998.0,
-            sl_current=1998.0, tp1=2001.0, tp2=2002.0, status="CLOSED",
-            exit_ts_utc=datetime.now(timezone.utc), exit_reason="TP2",
-        )
-        store.insert_trade(t)
-
-        sig = _sig()
-        store.insert_signal(sig)
-        try_execute(sig)
-        status = sqlite3.connect(store.DB_PATH).execute(
-            "SELECT status FROM signals WHERE signal_id=?", (sig.signal_id,)
-        ).fetchone()[0]
-        assert status == "SKIPPED_COOLDOWN"
-
-    def test_gate3_spread_skipped(self, monkeypatch):
-        monkeypatch.setattr("mt5_client.is_connected", lambda: True)
-        monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [])
-        monkeypatch.setattr("mt5_client.get_pending_orders", lambda magic=None: [])
         monkeypatch.setattr("mt5_client.get_spread_pips", lambda symbol=None: 9.9)
-
-        sig = _sig(); store.insert_signal(sig)
-        try_execute(sig)
-        row = sqlite3.connect(store.DB_PATH).execute(
-            "SELECT status, skip_reason FROM signals WHERE signal_id=?", (sig.signal_id,)
-        ).fetchone()
-        assert row[0] == "SKIPPED_SPREAD"
-        assert "9.9" in row[1]
-
-    def test_gate4_sl_too_wide(self, mt5_connected):
+        monkeypatch.setattr("mt5_client.place_market", lambda **kw: _ok_market_result())
+        monkeypatch.setattr("execution.engine._cooldown_ok", lambda *args: False)
+        monkeypatch.setattr("execution.engine.is_red_news_window", lambda dt: True)
+        monkeypatch.setattr("execution.engine._vol_regime_now", lambda: "normal")
         from config import cfg
         sig = _sig(sl_pips=cfg.SL_MAX_PIPS + 5)
         store.insert_signal(sig)
         try_execute(sig)
-        status = sqlite3.connect(store.DB_PATH).execute(
-            "SELECT status FROM signals WHERE signal_id=?", (sig.signal_id,)
-        ).fetchone()[0]
-        assert status == "SKIPPED_SL_TOO_WIDE"
+        con = sqlite3.connect(store.DB_PATH)
+        con.row_factory = sqlite3.Row
+        trade = con.execute("SELECT * FROM trades WHERE signal_id=?", (sig.signal_id,)).fetchone()
+        status = con.execute("SELECT status FROM signals WHERE signal_id=?", (sig.signal_id,)).fetchone()[0]
+        con.close()
+        assert status == "EXECUTED"
+        assert trade["would_block_position"] == 1
+        assert trade["would_block_cooldown"] == 1
+        assert trade["would_block_news"] == 1
+        assert trade["would_block_spread"] == 1
+        assert trade["sl_structural_pips"] == pytest.approx(cfg.SL_MAX_PIPS + 5)
 
     def test_gate5_disconnected_skipped(self, monkeypatch):
         monkeypatch.setattr("mt5_client.is_connected", lambda: False)

@@ -21,6 +21,19 @@ class Signal:
     confluences: list[str] = field(default_factory=list)
     score: int = 0
     context: dict = field(default_factory=dict)
+    setup: str = ""
+
+    @property
+    def sl_structural(self) -> float:
+        return self.sl
+
+    @property
+    def tp_final(self) -> float:
+        return self.tp2
+
+    @property
+    def meta(self) -> dict:
+        return self.context
 
     def to_row(self) -> dict:
         import json
@@ -28,6 +41,7 @@ class Signal:
             "signal_id": self.signal_id,
             "ts_utc": self.ts_utc.isoformat(),
             "strategy": self.strategy,
+            "setup": self.setup or self.strategy,
             "direction": self.direction,
             "killzone": self.killzone,
             "entry_type": self.entry_type,
@@ -68,6 +82,15 @@ class TradeRecord:
     news_flag: bool = False
     vol_regime: str = "normal"
     spread_at_entry_pips: float = 0.0
+    sl_structural_pips: float = 0.0
+    would_block_position: bool = False
+    would_block_cooldown: bool = False
+    would_block_news: bool = False
+    would_block_spread: bool = False
+    commission_usd: float = 0.0
+    swap_usd: float = 0.0
+    pnl_gross_usd: float | None = None
+    pnl_net_usd: float | None = None
     be_target: float | None = None   # queued BE price (persisted for crash recovery)
     be_retries: int = 0              # number of BE-modify attempts so far
 
@@ -95,6 +118,15 @@ class TradeRecord:
             "news_flag": int(self.news_flag),
             "vol_regime": self.vol_regime,
             "spread_at_entry_pips": self.spread_at_entry_pips,
+            "sl_structural_pips": self.sl_structural_pips,
+            "would_block_position": int(self.would_block_position),
+            "would_block_cooldown": int(self.would_block_cooldown),
+            "would_block_news": int(self.would_block_news),
+            "would_block_spread": int(self.would_block_spread),
+            "commission_usd": self.commission_usd,
+            "swap_usd": self.swap_usd,
+            "pnl_gross_usd": self.pnl_gross_usd,
+            "pnl_net_usd": self.pnl_net_usd,
             "be_target": self.be_target,
             "be_retries": self.be_retries,
         }
@@ -127,6 +159,15 @@ class TradeRecord:
             news_flag=bool(row["news_flag"]),
             vol_regime=row["vol_regime"] or "normal",
             spread_at_entry_pips=row["spread_at_entry_pips"] or 0.0,
+            sl_structural_pips=row.get("sl_structural_pips") or 0.0,
+            would_block_position=bool(row.get("would_block_position") or 0),
+            would_block_cooldown=bool(row.get("would_block_cooldown") or 0),
+            would_block_news=bool(row.get("would_block_news") or 0),
+            would_block_spread=bool(row.get("would_block_spread") or 0),
+            commission_usd=row.get("commission_usd") or 0.0,
+            swap_usd=row.get("swap_usd") or 0.0,
+            pnl_gross_usd=row.get("pnl_gross_usd"),
+            pnl_net_usd=row.get("pnl_net_usd"),
             be_target=row.get("be_target"),
             be_retries=row.get("be_retries") or 0,
         )

@@ -227,11 +227,13 @@ if (-not $NssmCandidates) {
     if ($existingSvc) {
         Write-SKIP "Service '$SvcName' already installed (status: $($existingSvc.Status))."
     } else {
-        & $Nssm install $SvcName $Python "-m" "uvicorn" "reporting.dashboard:app" "--host" "127.0.0.1" "--port" "8080"
+        & $Nssm install $SvcName $Python "-m" "uvicorn" "reporting.dashboard:app" "--host" "127.0.0.1" "--port" "8080" "--no-access-log"
         & $Nssm set $SvcName AppDirectory $Root
         & $Nssm set $SvcName AppStdout (Join-Path $LogDir "dashboard.log")
         & $Nssm set $SvcName AppStderr (Join-Path $LogDir "dashboard-error.log")
         & $Nssm set $SvcName AppRotateFiles 1
+        & $Nssm set $SvcName AppRotateOnline 1
+        & $Nssm set $SvcName AppRotateBytes 10485760
         Write-OK "Service '$SvcName' installed (port 8080)."
     }
 }

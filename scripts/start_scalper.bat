@@ -5,8 +5,10 @@
 cd /d C:\Users\BotVm\Desktop\xauusd-scalper
 if not exist logs mkdir logs
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\ops\rotate_log.ps1" -Path "logs\scalper-wrapper.log"
+
 powershell -NoProfile -Command "(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' [WRAPPER] scalper starting'" >> logs\scalper-wrapper.log
 
-%~dp0..\.venv\Scripts\python.exe main.py >> logs\scalper-wrapper.log 2>&1
+%~dp0..\.venv\Scripts\python.exe main.py
 
 powershell -NoProfile -Command "(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' [WRAPPER] scalper exited (code %ERRORLEVEL%)'" >> logs\scalper-wrapper.log

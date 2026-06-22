@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS signals (
     signal_id TEXT PRIMARY KEY,
     ts_utc TEXT NOT NULL,
     strategy TEXT NOT NULL,
+    setup TEXT,
     direction TEXT NOT NULL,
     killzone TEXT NOT NULL,
     entry_type TEXT NOT NULL,
@@ -42,7 +43,16 @@ CREATE TABLE IF NOT EXISTS trades (
     mae_pips REAL DEFAULT 0, mfe_pips REAL DEFAULT 0,
     news_flag INTEGER DEFAULT 0,
     vol_regime TEXT,
-    spread_at_entry_pips REAL
+    spread_at_entry_pips REAL,
+    sl_structural_pips REAL,
+    would_block_position INTEGER DEFAULT 0,
+    would_block_cooldown INTEGER DEFAULT 0,
+    would_block_news INTEGER DEFAULT 0,
+    would_block_spread INTEGER DEFAULT 0,
+    commission_usd REAL DEFAULT 0,
+    swap_usd REAL DEFAULT 0,
+    pnl_gross_usd REAL,
+    pnl_net_usd REAL
 );
 
 CREATE TABLE IF NOT EXISTS trade_events (
@@ -76,8 +86,18 @@ def init_db() -> None:
         con.executescript(_DDL)
         # Idempotent migrations — SQLite has no ADD COLUMN IF NOT EXISTS
         for stmt in (
+            "ALTER TABLE signals ADD COLUMN setup TEXT",
             "ALTER TABLE trades ADD COLUMN be_target REAL",
             "ALTER TABLE trades ADD COLUMN be_retries INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN sl_structural_pips REAL",
+            "ALTER TABLE trades ADD COLUMN would_block_position INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN would_block_cooldown INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN would_block_news INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN would_block_spread INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN commission_usd REAL DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN swap_usd REAL DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN pnl_gross_usd REAL",
+            "ALTER TABLE trades ADD COLUMN pnl_net_usd REAL",
         ):
             try:
                 con.execute(stmt)
@@ -92,11 +112,11 @@ def insert_signal(sig: Signal, status: str = "DETECTED", skip_reason: str | None
     with _conn() as con:
         con.execute(
             """INSERT OR IGNORE INTO signals
-               (signal_id, ts_utc, strategy, direction, killzone, entry_type,
+               (signal_id, ts_utc, strategy, setup, direction, killzone, entry_type,
                 entry_price, entry_zone_low, entry_zone_high,
                 sl, tp1, tp2, sl_pips, score, confluences, context, status, skip_reason)
                VALUES
-               (:signal_id,:ts_utc,:strategy,:direction,:killzone,:entry_type,
+               (:signal_id,:ts_utc,:strategy,:setup,:direction,:killzone,:entry_type,
                 :entry_price,:entry_zone_low,:entry_zone_high,
                 :sl,:tp1,:tp2,:sl_pips,:score,:confluences,:context,:status,:skip_reason)""",
             row,
@@ -120,13 +140,19 @@ def insert_trade(trade: TradeRecord) -> None:
                 entry_price_fill, entry_ts_utc, sl_initial, sl_current, tp1, tp2,
                 status, exit_reason, exit_ts_utc, pnl_pips, pnl_usd,
                 mae_pips, mfe_pips, news_flag, vol_regime, spread_at_entry_pips,
-                be_target, be_retries)
+                be_target, be_retries, sl_structural_pips,
+                would_block_position, would_block_cooldown, would_block_news,
+                would_block_spread, commission_usd, swap_usd,
+                pnl_gross_usd, pnl_net_usd)
                VALUES
                (:trade_id,:signal_id,:mt5_ticket,:strategy,:direction,:lot,
                 :entry_price_fill,:entry_ts_utc,:sl_initial,:sl_current,:tp1,:tp2,
                 :status,:exit_reason,:exit_ts_utc,:pnl_pips,:pnl_usd,
                 :mae_pips,:mfe_pips,:news_flag,:vol_regime,:spread_at_entry_pips,
-                :be_target,:be_retries)""",
+                :be_target,:be_retries,:sl_structural_pips,
+                :would_block_position,:would_block_cooldown,:would_block_news,
+                :would_block_spread,:commission_usd,:swap_usd,
+                :pnl_gross_usd,:pnl_net_usd)""",
             row,
         )
 

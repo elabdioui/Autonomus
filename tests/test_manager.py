@@ -80,7 +80,7 @@ def _make_trade(direction="LONG", strategy="S1", status="OPEN",
         strategy=strategy, direction=direction,
         killzone="LONDON", entry_type="MARKET",
         entry_price=entry, entry_zone_low=entry-0.5, entry_zone_high=entry+0.5,
-        sl=sl, tp1=tp1, tp2=tp2, sl_pips=abs(entry-sl)/0.10,
+        sl=sl, tp1=tp1, tp2=tp2, sl_pips=abs(entry-sl)/cfg.PIP,
         confluences=[], score=0, context={},
     )
     store.insert_signal(sig, status="EXECUTED")
@@ -119,7 +119,7 @@ def _get_events(trade_id: str) -> list[str]:
 # ── Helper to patch all MT5 calls for a "position exists, no triggers" scenario ──
 
 def _patch_quiet(monkeypatch, trade: TradeRecord,
-                  bid=2000.2, ask=2000.4):
+                  bid=2000.05, ask=2000.07):
     """Position open, price not at TP1, no modifications needed."""
     pos = FakePos(ticket=trade.mt5_ticket)
     monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
@@ -217,16 +217,16 @@ class TestTp1Breakeven:
 
         row = _get_trade(trade.trade_id)
         assert row["status"] == "PARTIAL"
-        assert row["sl_current"] == pytest.approx(2000.0 + 0.5 * 0.10, abs=0.01)  # BE
+        assert row["sl_current"] == pytest.approx(2000.0 + 0.5 * cfg.PIP, abs=0.001)
         events = _get_events(trade.trade_id)
         assert "TP1_PARTIAL" in events
         assert "SL_TO_BE" in events
 
-    def test_s3_uses_s3_tp1_pips(self, monkeypatch):
-        """S3 uses S3_TP1_PIPS (8 pips) not the default TP1_PIPS (10)."""
-        s3_tp1 = cfg.S3_TP1_PIPS * 0.10   # price offset
+    def test_s3_uses_common_executed_r_for_tp1(self, monkeypatch):
+        """S3 shares the 20-pip executed R even though its final target is EMA."""
+        s3_tp1 = cfg.TP1_PIPS * cfg.PIP
         trade = _make_trade("LONG", strategy="S3", entry=2000.0,
-                            tp1=2000.0 + s3_tp1, tp2=2000.0 + cfg.S3_TP2_PIPS * 0.10)
+                            tp1=2000.0 + s3_tp1, tp2=2000.0 + cfg.TP2_PIPS * cfg.PIP)
         pos = FakePos(ticket=trade.mt5_ticket)
 
         from mt5_client import OrderResult
@@ -234,9 +234,11 @@ class TestTp1Breakeven:
         # bid exactly at S3_TP1 trigger
         # Use price 0.1 pip above the S3_TP1 threshold to avoid float precision issues
         monkeypatch.setattr("mt5_client.get_tick",
-                            lambda symbol=None: FakeTick(bid=2000.0 + s3_tp1 + 0.01, ask=2000.0 + s3_tp1 + 0.21))
+                            lambda symbol=None: FakeTick(bid=2000.0 + s3_tp1 + cfg.POINT,
+                                                         ask=2000.0 + s3_tp1 + 2 * cfg.POINT))
         monkeypatch.setattr("mt5_client.close_position_partial",
-                            lambda ticket, lot: OrderResult(True, ticket=ticket, fill_price=2000.0 + s3_tp1 + 0.01))
+                            lambda ticket, lot: OrderResult(True, ticket=ticket,
+                                                            fill_price=2000.0 + s3_tp1 + cfg.POINT))
         monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: True)
         monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
 
@@ -246,7 +248,7 @@ class TestTp1Breakeven:
     def test_no_tp1_when_below_trigger(self, monkeypatch):
         """Price 5 pips favorable < 10-pip TP1 → stays OPEN."""
         trade = _make_trade("LONG", entry=2000.0, tp1=2001.0)
-        _patch_quiet(monkeypatch, trade, bid=2000.5, ask=2000.7)
+        _patch_quiet(monkeypatch, trade, bid=2000.19, ask=2000.20)
         manage_open_trades()
         assert _get_trade(trade.trade_id)["status"] == "OPEN"
 
@@ -354,37 +356,39 @@ class TestExitDetection:
         ]
 
     def test_tp2_exit_detected(self, monkeypatch):
-        trade = _make_trade("LONG", entry=2000.0, tp2=2002.0)
+        tp2 = 2000.0 + cfg.TP2_PIPS * cfg.PIP
+        trade = _make_trade("LONG", entry=2000.0, tp2=tp2)
         # Position gone → exit at TP2
         monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [])
         monkeypatch.setattr("mt5_client.get_deal_history",
-                            lambda ticket: self._exit_deals(2002.0, profit=40.0))
-        monkeypatch.setattr("mt5_client.get_tick", lambda symbol=None: FakeTick(2002.0, 2002.2))
+                            lambda ticket: self._exit_deals(tp2, profit=40.0))
+        monkeypatch.setattr("mt5_client.get_tick", lambda symbol=None: FakeTick(tp2, tp2 + 0.02))
 
         manage_open_trades()
 
         row = _get_trade(trade.trade_id)
         assert row["status"] == "CLOSED"
         assert row["exit_reason"] == "TP2"
-        assert row["pnl_pips"] == pytest.approx(20.0, abs=0.5)  # (2002-2000)/0.10
+        assert row["pnl_pips"] == pytest.approx(cfg.TP2_PIPS, abs=0.5)
         assert row["pnl_usd"] == pytest.approx(40.0 - 0.5, abs=0.1)
 
     def test_sl_exit_detected(self, monkeypatch):
-        trade = _make_trade("LONG", entry=2000.0, sl=1998.0)
+        sl = 2000.0 - cfg.SL_MAX_PIPS * cfg.PIP
+        trade = _make_trade("LONG", entry=2000.0, sl=sl)
         monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [])
         monkeypatch.setattr("mt5_client.get_deal_history",
-                            lambda ticket: self._exit_deals(1998.0, profit=-40.0))
-        monkeypatch.setattr("mt5_client.get_tick", lambda symbol=None: FakeTick(1998.0, 1998.2))
+                            lambda ticket: self._exit_deals(sl, profit=-40.0))
+        monkeypatch.setattr("mt5_client.get_tick", lambda symbol=None: FakeTick(sl, sl + 0.02))
 
         manage_open_trades()
 
         row = _get_trade(trade.trade_id)
         assert row["exit_reason"] == "SL"
-        assert row["pnl_pips"] == pytest.approx(-20.0, abs=0.5)
+        assert row["pnl_pips"] == pytest.approx(-cfg.SL_MAX_PIPS, abs=0.5)
 
     def test_be_exit_detected(self, monkeypatch):
         """Closed at breakeven SL → exit_reason=BE."""
-        be_price = 2000.0 + 0.5 * 0.10  # 0.5 pips above entry
+        be_price = 2000.0 + 0.5 * cfg.PIP
         trade = _make_trade("LONG", entry=2000.0, sl=1998.0, status="PARTIAL")
         # Set sl_current to BE price
         store.update_trade(trade.trade_id, sl_current=be_price)
@@ -531,17 +535,25 @@ class TestShortTrades:
     def test_short_tp1_on_downward_move(self, monkeypatch):
         """SHORT: price falls 10 pips from entry → TP1 trigger."""
         entry = 2005.0
-        trade = _make_trade("SHORT", entry=entry, sl=entry + 2.0,
-                            tp1=entry - 1.0, tp2=entry - 2.0)
+        trade = _make_trade("SHORT", entry=entry,
+                            sl=entry + cfg.SL_MAX_PIPS * cfg.PIP,
+                            tp1=entry - cfg.TP1_PIPS * cfg.PIP,
+                            tp2=entry - cfg.TP2_PIPS * cfg.PIP)
         pos = FakePos(ticket=trade.mt5_ticket, type=1)  # SELL
 
         from mt5_client import OrderResult
         monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
         # ask at entry - 10 pips = 2004.0 → 10 pip favorable for SHORT
         monkeypatch.setattr("mt5_client.get_tick",
-                            lambda symbol=None: FakeTick(bid=2003.8, ask=2004.0))
+                            lambda symbol=None: FakeTick(
+                                bid=entry - cfg.TP1_PIPS * cfg.PIP - 2 * cfg.POINT,
+                                ask=entry - cfg.TP1_PIPS * cfg.PIP,
+                            ))
         monkeypatch.setattr("mt5_client.close_position_partial",
-                            lambda ticket, lot: OrderResult(True, ticket=ticket, fill_price=2004.0))
+                            lambda ticket, lot: OrderResult(
+                                True, ticket=ticket,
+                                fill_price=entry - cfg.TP1_PIPS * cfg.PIP,
+                            ))
         monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: True)
         monkeypatch.setattr("mt5_client.get_deal_history", lambda ticket: [])
 
@@ -551,7 +563,7 @@ class TestShortTrades:
         assert row["status"] == "PARTIAL"
         be = row["sl_current"]
         # BE for SHORT = entry - 0.5 pip buffer
-        assert be == pytest.approx(entry - 0.5 * 0.10, abs=0.01)
+        assert be == pytest.approx(entry - 0.5 * cfg.PIP, abs=0.001)
 
 
 # ── Fix 1: FRIDAY_FLAT exit reason ────────────────────────────────────────────
@@ -612,7 +624,7 @@ class TestFinalizeClosePnl:
         pos = FakePos(ticket=trade.mt5_ticket)
 
         from mt5_client import OrderResult
-        exit_price = 2001.5   # 15 pips profit
+        exit_price = 2000.0 + 15 * cfg.PIP
         deals = self._out_deals(exit_price, profit=30.0)
 
         monkeypatch.setattr("mt5_client.get_positions", lambda magic=None: [pos])
@@ -685,7 +697,7 @@ class TestBeDbPersistence:
 
         manage_open_trades()
 
-        expected_be = round(2000.0 + 0.5 * 0.10, 2)
+        expected_be = round(2000.0 + 0.5 * cfg.PIP, cfg.DIGITS)
         assert any(abs(sl - expected_be) < 0.01 for sl in modify_calls), \
             f"modify_position_sl not called with BE price. calls={modify_calls}"
 
@@ -711,7 +723,7 @@ class TestBeDbPersistence:
         monkeypatch.setattr("mt5_client.modify_position_sl", lambda ticket, sl: False)
         manage_open_trades()
         row = _get_trade(trade.trade_id)
-        expected_be = round(2000.0 + 0.5 * 0.10, 2)
+        expected_be = round(2000.0 + 0.5 * cfg.PIP, cfg.DIGITS)
         assert row["be_target"] == pytest.approx(expected_be, abs=0.01)
         assert row["be_retries"] >= 1
 

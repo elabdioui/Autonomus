@@ -34,14 +34,14 @@ def find_swings(df: pd.DataFrame, lookback: int = 5) -> list[Swing]:
     A swing high at bar i requires `lookback` candles on each side with strictly
     lower highs. It is confirmed only at the CLOSE of bar i+lookback.
 
-    Only swings whose confirmed_index <= len(df)-2 are returned, ensuring the
-    forming candle (df.iloc[-1]) is never used as a confirmation bar.
+    The caller must pass closed candles (normally via ``strategies._bars.closed``).
+    A pivot is exposed only after the candle at ``pivot + lookback`` has closed.
     """
     swings: list[Swing] = []
     n = len(df)
     highs = df["high"].values
     lows = df["low"].values
-    max_confirmed = n - 2  # last closed candle index
+    max_confirmed = n - 1
 
     for i in range(lookback, n - lookback):
         confirmed_idx = i + lookback

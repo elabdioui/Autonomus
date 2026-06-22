@@ -1,10 +1,10 @@
 """MT5 connection, OHLC helpers, and order functions.
 
-Startup validation exits hard; reconnect() returns False gracefully (for mid-session use).
+Startup and reconnect failures are recoverable; the process remains alive.
 TP on MT5 orders = TP2; TP1 is managed in software (partial close in SPEC 4).
 """
 import logging
-import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,41 +48,64 @@ def _ensure_tf_map() -> None:
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-def connect() -> bool:
-    """Initial connection at startup. Calls sys.exit(1) on any failure."""
+def _last_error_text() -> str:
+    err = mt5.last_error() if _MT5_AVAILABLE else (-1, "MetaTrader5 unavailable")
+    return f"code={err[0]} msg={err[1]}"
+
+
+def _connect_once() -> bool:
+    """Perform one complete initialize/login/symbol-select attempt."""
     if not _MT5_AVAILABLE:
-        log.critical("MetaTrader5 package not installed — cannot connect")
-        sys.exit(1)
+        log.error("MetaTrader5 package not installed - waiting for availability")
+        return False
 
     terminal_path = cfg.MT5_TERMINAL_PATH
     if not terminal_path:
-        log.critical("MT5_TERMINAL_PATH is not set in .env — refusing to start")
-        sys.exit(1)
+        log.error("MT5_TERMINAL_PATH is not set in .env")
+        return False
     if not Path(terminal_path).exists():
-        log.critical("MT5_TERMINAL_PATH does not exist: %s", terminal_path)
-        sys.exit(1)
+        log.error("MT5_TERMINAL_PATH does not exist: %s", terminal_path)
+        return False
 
     _ensure_tf_map()
     ok = mt5.initialize(path=terminal_path, login=cfg.MT5_LOGIN,
                         password=cfg.MT5_PASSWORD, server=cfg.MT5_SERVER, timeout=30000)
     if not ok:
-        err = mt5.last_error()
-        log.critical("MT5 initialize() failed — code=%s msg=%s", err[0], err[1])
-        sys.exit(1)
+        log.error("MT5 initialize() failed - %s", _last_error_text())
+        return False
 
     acc = mt5.account_info()
     if acc is None:
-        log.critical("MT5 init succeeded but account_info() is None — terminal not logged in")
-        mt5.shutdown(); sys.exit(1)
+        log.error("MT5 init succeeded but account_info() is None - %s", _last_error_text())
+        mt5.shutdown()
+        return False
     if acc.login != cfg.MT5_LOGIN:
-        log.critical("Login mismatch: expected %s got %s", cfg.MT5_LOGIN, acc.login)
-        mt5.shutdown(); sys.exit(1)
+        log.error("MT5 login mismatch: expected=%s actual=%s", cfg.MT5_LOGIN, acc.login)
+        mt5.shutdown()
+        return False
     if not mt5.symbol_select(cfg.SYMBOL, True):
-        log.critical("symbol_select(%s) failed: %s", cfg.SYMBOL, mt5.last_error())
-        mt5.shutdown(); sys.exit(1)
+        log.error("symbol_select(%s) failed - %s", cfg.SYMBOL, _last_error_text())
+        mt5.shutdown()
+        return False
 
     log.info("MT5 connected — account=%s server=%s symbol=%s", acc.login, cfg.MT5_SERVER, cfg.SYMBOL)
     return True
+
+
+def connect() -> bool:
+    """Initial connection with bounded backoff; never terminates the process."""
+    attempts = max(1, cfg.MT5_CONNECT_RETRIES)
+    for attempt in range(1, attempts + 1):
+        if _connect_once():
+            return True
+        delay = min(cfg.MT5_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    cfg.MT5_RETRY_MAX_SECONDS)
+        log.warning("MT5 startup attempt %d/%d failed; retrying in %.1fs",
+                    attempt, attempts, delay)
+        if attempt < attempts:
+            time.sleep(delay)
+    log.error("MT5 unavailable after %d startup attempts; bot remains alive", attempts)
+    return False
 
 
 def reconnect() -> bool:
@@ -97,17 +120,11 @@ def reconnect() -> bool:
         mt5.shutdown()
     except Exception:
         pass
-    ok = mt5.initialize(path=terminal_path, login=cfg.MT5_LOGIN,
-                        password=cfg.MT5_PASSWORD, server=cfg.MT5_SERVER, timeout=30000)
-    if not ok:
-        log.error("reconnect: initialize() failed: %s", mt5.last_error())
+    if not _connect_once():
+        log.warning("MT5 reconnect failed - %s", _last_error_text())
         return False
-    acc = mt5.account_info()
-    if acc is None or acc.login != cfg.MT5_LOGIN:
-        mt5.shutdown()
-        return False
-    mt5.symbol_select(cfg.SYMBOL, True)
-    log.info("MT5 reconnected — account=%s", acc.login)
+    log.info("MT5 state: disconnected -> connected (account=%s symbol=%s)",
+             cfg.MT5_LOGIN, cfg.SYMBOL)
     return True
 
 
@@ -150,7 +167,21 @@ def get_spread_pips(symbol: str | None = None) -> float:
     tick = mt5.symbol_info_tick(sym)
     if tick is None:
         return 0.0
-    return round((tick.ask - tick.bid) / 0.10, 2)
+    return round((tick.ask - tick.bid) / cfg.PIP, 2)
+
+
+def _validated_prices(direction: str, entry: float, sl: float, tp: float) -> tuple[float, float, str | None]:
+    """Round and validate stops against the actual requested entry price."""
+    entry = round(float(entry), cfg.DIGITS)
+    sl = round(float(sl), cfg.DIGITS)
+    tp = round(float(tp), cfg.DIGITS)
+    valid = (sl < entry < tp) if direction == "LONG" else (tp < entry < sl)
+    if not valid or sl == entry or tp == entry:
+        reason = (f"invalid stops direction={direction} entry={entry:.3f} "
+                  f"sl={sl:.3f} tp={tp:.3f}")
+        log.error(reason)
+        return sl, tp, reason
+    return sl, tp, None
 
 
 def get_scalper_timeframes(symbol: str | None = None) -> dict[str, pd.DataFrame]:
@@ -160,6 +191,7 @@ def get_scalper_timeframes(symbol: str | None = None) -> dict[str, pd.DataFrame]
         "M5":  get_ohlc(sym, "M5",  cfg.OHLC_COUNT_M5),
         "M15": get_ohlc(sym, "M15", cfg.OHLC_COUNT_M15),
         "H1":  get_ohlc(sym, "H1",  cfg.OHLC_COUNT_H1),
+        "H4":  get_ohlc(sym, "H4",  cfg.OHLC_COUNT_H4),
     }
 
 
@@ -208,12 +240,21 @@ def place_market(direction: str, lot: float, sl: float, tp: float,
         return OrderResult(False, comment="No tick data")
 
     is_buy = direction == "LONG"
+    entry = tick.ask if is_buy else tick.bid
+    # Re-anchor market stops to the executable tick so price movement between
+    # detection and order_send cannot put a stop on the wrong side.
+    sl = entry - cfg.SL_MAX_PIPS * cfg.PIP if is_buy else entry + cfg.SL_MAX_PIPS * cfg.PIP
+    if (is_buy and tp <= entry) or (not is_buy and tp >= entry):
+        tp = entry + cfg.TP2_PIPS * cfg.PIP if is_buy else entry - cfg.TP2_PIPS * cfg.PIP
+    sl, tp, error = _validated_prices(direction, entry, sl, tp)
+    if error:
+        return OrderResult(False, retcode=10016, comment=error)
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       cfg.SYMBOL,
         "volume":       float(lot),
         "type":         mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
-        "price":        tick.ask if is_buy else tick.bid,
+        "price":        round(entry, cfg.DIGITS),
         "sl":           float(sl),
         "tp":           float(tp),
         "magic":        magic,
@@ -229,12 +270,16 @@ def place_limit(direction: str, price: float, lot: float, sl: float, tp: float,
     if not _MT5_AVAILABLE:
         return OrderResult(False, comment="MT5 unavailable")
     is_buy = direction == "LONG"
+    price = round(float(price), cfg.DIGITS)
+    sl, tp, error = _validated_prices(direction, price, sl, tp)
+    if error:
+        return OrderResult(False, retcode=10016, comment=error)
     req = {
         "action":       mt5.TRADE_ACTION_PENDING,
         "symbol":       cfg.SYMBOL,
         "volume":       float(lot),
         "type":         mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT,
-        "price":        float(price),
+        "price":        price,
         "sl":           float(sl),
         "tp":           float(tp),
         "magic":        magic,

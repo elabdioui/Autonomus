@@ -3,6 +3,8 @@ import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from config import cfg
+
 
 @dataclass
 class FVG:
@@ -26,14 +28,14 @@ def detect_fvg(df: pd.DataFrame, min_size_pips: float = 3.0) -> list[FVG]:
     3-candle pattern: gap between candle[i-1] and candle[i+1].
     Upper bound is len(df)-2 so c3 is always the last CLOSED candle — never the forming one.
     """
-    if len(df) < 4:
+    if len(df) < 3:
         return []
 
-    pip_unit = 0.10
+    pip_unit = cfg.PIP
     min_size = min_size_pips * pip_unit
     fvgs: list[FVG] = []
 
-    for i in range(1, len(df) - 2):
+    for i in range(1, len(df) - 1):
         c1 = df.iloc[i - 1]
         c2 = df.iloc[i]
         c3 = df.iloc[i + 1]

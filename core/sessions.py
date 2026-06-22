@@ -5,7 +5,7 @@ import pytz
 
 from config import cfg
 
-KillzoneName = Literal["ASIA", "LONDON", "NY_AM", "NY_PM"]
+KillzoneName = Literal["ASIA", "LONDON", "NY_AM", "NY_PM", "OFF"]
 
 # Each entry: (start_hour_utc, end_hour_utc)
 # ASIA spans midnight: handled specially in get_active_killzone.
@@ -37,6 +37,19 @@ def get_active_killzone(dt: datetime | None = None) -> KillzoneName | None:
         if _in_window(hour, start, end):
             return name  # type: ignore[return-value]
     return None
+
+
+def get_killzone_tag(dt: datetime | None = None) -> KillzoneName:
+    """Return the descriptive UTC killzone tag; this value never gates scans."""
+    if dt is None:
+        dt = datetime.now(tz=pytz.utc)
+    elif dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    hour = dt.astimezone(pytz.utc).hour
+    for name, (start, end) in _KILLZONES_UTC.items():
+        if _in_window(hour, start, end):
+            return name  # type: ignore[return-value]
+    return "OFF"
 
 
 def is_in_killzone(dt: datetime | None = None) -> bool:

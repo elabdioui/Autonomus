@@ -14,7 +14,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 import core.store as _store
 from reporting.metrics import (
-    compute_stats, compute_funnel, _STRATEGIES, _EXIT_REASONS,
+    compute_stats, compute_funnel, compute_by_killzone,
+    _STRATEGIES, _KILLZONES, _EXIT_REASONS,
 )
 
 app = FastAPI(title="xauusd-scalper", docs_url=None, redoc_url=None)
@@ -74,11 +75,23 @@ def _open_positions_html() -> str:
     con.close()
     if not rows:
         return '<p class="gray">No open positions.</p>'
-    cols = ["Ticket", "Strategy", "Dir", "Entry", "SL", "TP1", "TP2", "Status", "EntryTs"]
-    data = [[r["mt5_ticket"], r["strategy"], r["direction"],
-             f"{r['entry_price_fill']:.2f}", f"{r['sl_current']:.2f}",
-             f"{r['tp1']:.2f}", f"{r['tp2']:.2f}", r["status"], r["entry_ts_utc"][:16]]
-            for r in rows]
+    cols = ["Ticket", "Strategy", "Dir", "Entry", "SL", "TP1", "TP2",
+            "Structural SL", "Spread", "Tags", "Status", "EntryTs"]
+    data = []
+    for r in rows:
+        structural = r["sl_structural_pips"] or 0
+        sl_note = (f"{structural:.1f}p -> 20p" if structural != 20 else "20p")
+        tags = " ".join(name for name, value in (
+            ("position", r["would_block_position"]),
+            ("cooldown", r["would_block_cooldown"]),
+            ("news", r["would_block_news"]),
+            ("spread", r["would_block_spread"]),
+        ) if value) or "-"
+        data.append([r["mt5_ticket"], r["strategy"], r["direction"],
+                     f"{r['entry_price_fill']:.3f}", f"{r['sl_current']:.3f}",
+                     f"{r['tp1']:.3f}", f"{r['tp2']:.3f}", sl_note,
+                     f"{(r['spread_at_entry_pips'] or 0):.1f}p", tags,
+                     r["status"], r["entry_ts_utc"][:16]])
     return _table(cols, data)
 
 
@@ -86,23 +99,41 @@ def _todays_trades_html() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     con = _con()
     rows = con.execute(
-        "SELECT * FROM trades WHERE status='CLOSED' AND exit_ts_utc LIKE ? ORDER BY exit_ts_utc DESC",
+        """SELECT t.*, s.killzone FROM trades t
+           LEFT JOIN signals s ON s.signal_id=t.signal_id
+           WHERE t.status='CLOSED' AND t.exit_ts_utc LIKE ?
+           ORDER BY t.exit_ts_utc DESC""",
         (f"{today}%",)
     ).fetchall()
     con.close()
     if not rows:
         return f'<p class="gray">No closed trades today ({today}).</p>'
-    cols = ["Ticket", "Strategy", "Dir", "ExitReason", "PnlPips", "PnlUsd", "ExitTs"]
+    cols = ["Ticket", "Strategy", "KZ", "Dir", "SL structural/executed",
+            "Spread", "Gross$", "Commission$", "Net$", "Tags", "ExitReason", "ExitTs"]
     data = []
     for r in rows:
         pip = r["pnl_pips"] or 0
         cls = "green" if pip > 0 else "red"
-        data.append([
-            r["mt5_ticket"], r["strategy"], r["direction"], r["exit_reason"],
-            f'<span class="{cls}">{pip:+.1f}</span>',
-            f'<span class="{cls}">{(r["pnl_usd"] or 0):+.2f}</span>',
-            r["exit_ts_utc"][:16],
-        ])
+        structural = r["sl_structural_pips"] or 0
+        if structural > 20:
+            sl_note = f'<span class="badge badge-warn">structural {structural:.1f}p - capped at 20p</span>'
+        elif structural < 20:
+            sl_note = f'<span class="badge badge-ok">structural {structural:.1f}p - executed at 20p</span>'
+        else:
+            sl_note = "20p"
+        net = r["pnl_net_usd"] if r["pnl_net_usd"] is not None else (r["pnl_usd"] or 0)
+        tags = " ".join(name for name, value in (
+            ("position", r["would_block_position"]),
+            ("cooldown", r["would_block_cooldown"]),
+            ("news", r["would_block_news"]),
+            ("spread", r["would_block_spread"]),
+        ) if value) or "-"
+        data.append([r["mt5_ticket"], r["strategy"], r["killzone"] or "-",
+                     r["direction"], sl_note, f'{(r["spread_at_entry_pips"] or 0):.1f}p',
+                     f'{(r["pnl_gross_usd"] or 0):+.2f}',
+                     f'{(r["commission_usd"] or 0):.2f}',
+                     f'<span class="{cls}">{net:+.2f}</span>', tags,
+                     r["exit_reason"], r["exit_ts_utc"][:16]])
     return _table(cols, data)
 
 
@@ -118,6 +149,18 @@ def _summary_html() -> str:
             "∞" if st.profit_factor == float("inf") else f"{st.profit_factor:.2f}",
             f"{st.total_pnl_pips:+.1f}", f"{st.total_pnl_usd:+.2f}",
         ])
+    return _table(cols, data)
+
+
+def _killzone_summary_html() -> str:
+    cols = ["Strategy", "Killzone", "Count", "Winrate%", "Expectancy", "Net$"]
+    matrix = compute_by_killzone()
+    data = []
+    for strategy in _STRATEGIES:
+        for killzone in _KILLZONES:
+            st = matrix[(strategy, killzone)]
+            data.append([strategy, killzone, st.count, f"{st.winrate*100:.0f}%",
+                         f"{st.expectancy_pips:+.2f}", f"{st.total_pnl_usd:+.2f}"])
     return _table(cols, data)
 
 
@@ -155,6 +198,9 @@ def _full_html() -> str:
 
 <h2>Per-Strategy Summary (all time)</h2>
 {_summary_html()}
+
+<h2>Strategy x Killzone Segmentation</h2>
+{_killzone_summary_html()}
 
 <h2>Last 20 Signals</h2>
 {_recent_signals_html()}
