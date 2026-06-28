@@ -73,6 +73,16 @@ class TradeRecord:
     tp1: float
     tp2: float
     status: str             # "PENDING" | "OPEN" | "PARTIAL" | "CLOSED" | "CANCELLED"
+    setup: str = ""
+    magic: int = 0
+    lifecycle_state: str = "OPEN"
+    sl_executed: float = 0.0
+    tp_final: float = 0.0
+    killzone: str = "OFF"
+    htf_bias: str = "NEUTRAL"
+    bias_aligned: bool = False
+    news_red_active: str = "unknown"
+    premium_discount: str = "EQ"
     exit_reason: str | None = None
     exit_ts_utc: datetime | None = None
     pnl_pips: float | None = None
@@ -91,6 +101,11 @@ class TradeRecord:
     swap_usd: float = 0.0
     pnl_gross_usd: float | None = None
     pnl_net_usd: float | None = None
+    tp1_hit: bool = False
+    partial_close_price: float | None = None
+    realized_r: float | None = None
+    realized_r_net: float | None = None
+    duration_s: int | None = None
     be_target: float | None = None   # queued BE price (persisted for crash recovery)
     be_retries: int = 0              # number of BE-modify attempts so far
 
@@ -109,6 +124,16 @@ class TradeRecord:
             "tp1": self.tp1,
             "tp2": self.tp2,
             "status": self.status,
+            "setup": self.setup or self.strategy,
+            "magic": self.magic,
+            "lifecycle_state": self.lifecycle_state,
+            "sl_executed": self.sl_executed or self.sl_initial,
+            "tp_final": self.tp_final or self.tp2,
+            "killzone": self.killzone,
+            "htf_bias": self.htf_bias,
+            "bias_aligned": int(self.bias_aligned),
+            "news_red_active": self.news_red_active,
+            "premium_discount": self.premium_discount,
             "exit_reason": self.exit_reason,
             "exit_ts_utc": self.exit_ts_utc.isoformat() if self.exit_ts_utc else None,
             "pnl_pips": self.pnl_pips,
@@ -127,6 +152,11 @@ class TradeRecord:
             "swap_usd": self.swap_usd,
             "pnl_gross_usd": self.pnl_gross_usd,
             "pnl_net_usd": self.pnl_net_usd,
+            "tp1_hit": int(self.tp1_hit),
+            "partial_close_price": self.partial_close_price,
+            "realized_r": self.realized_r,
+            "realized_r_net": self.realized_r_net,
+            "duration_s": self.duration_s,
             "be_target": self.be_target,
             "be_retries": self.be_retries,
         }
@@ -150,6 +180,18 @@ class TradeRecord:
             tp1=row["tp1"],
             tp2=row["tp2"],
             status=row["status"],
+            setup=row.get("setup") or row["strategy"],
+            magic=row.get("magic") or 0,
+            lifecycle_state=row.get("lifecycle_state") or (
+                "CLOSED" if row["status"] == "CLOSED" else row["status"]
+            ),
+            sl_executed=row.get("sl_executed") or row["sl_initial"],
+            tp_final=row.get("tp_final") or row["tp2"],
+            killzone=row.get("killzone") or "OFF",
+            htf_bias=row.get("htf_bias") or "NEUTRAL",
+            bias_aligned=bool(row.get("bias_aligned") or 0),
+            news_red_active=row.get("news_red_active") or "unknown",
+            premium_discount=row.get("premium_discount") or "EQ",
             exit_reason=row["exit_reason"],
             exit_ts_utc=_dt(row["exit_ts_utc"]),
             pnl_pips=row["pnl_pips"],
@@ -168,6 +210,11 @@ class TradeRecord:
             swap_usd=row.get("swap_usd") or 0.0,
             pnl_gross_usd=row.get("pnl_gross_usd"),
             pnl_net_usd=row.get("pnl_net_usd"),
+            tp1_hit=bool(row.get("tp1_hit") or 0),
+            partial_close_price=row.get("partial_close_price"),
+            realized_r=row.get("realized_r"),
+            realized_r_net=row.get("realized_r_net"),
+            duration_s=row.get("duration_s"),
             be_target=row.get("be_target"),
             be_retries=row.get("be_retries") or 0,
         )

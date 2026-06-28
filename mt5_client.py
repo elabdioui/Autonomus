@@ -157,6 +157,17 @@ def get_ohlc(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
+def get_closed_ohlc(timeframe: str, count: int = 60,
+                    symbol: str | None = None) -> pd.DataFrame:
+    """Return only completed candles; the MT5 forming row is always removed."""
+    frame = get_ohlc(symbol or cfg.SYMBOL, timeframe, count + 1)
+    if len(frame) < 2:
+        return frame.iloc[0:0].copy()
+    result = frame.iloc[:-1].copy().reset_index(drop=True)
+    result.attrs["closed_only"] = True
+    return result
+
+
 def get_current_price(symbol: str) -> float | None:
     tick = mt5.symbol_info_tick(symbol)
     return (tick.bid + tick.ask) / 2 if tick else None

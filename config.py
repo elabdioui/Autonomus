@@ -13,8 +13,10 @@ class Config:
     MT5_TERMINAL_PATH: str = os.getenv("MT5_TERMINAL_PATH", "")
 
     SYMBOL: str = os.getenv("SYMBOL", "XAUUSDm")
-    LOT: float = float(os.getenv("LOT", "0.2"))
-    MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "50"))
+    LOT_SIZE: float = float(os.getenv("LOT_SIZE", os.getenv("LOT", "0.2")))
+    LOT: float = LOT_SIZE  # backward-compatible alias
+    RUNAWAY_MAX_OPEN: int = int(os.getenv("RUNAWAY_MAX_OPEN", os.getenv("MAX_OPEN_POSITIONS", "50")))
+    MAX_OPEN_POSITIONS: int = RUNAWAY_MAX_OPEN
     SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
 
     ENABLED_STRATEGIES: list[str] = os.getenv("ENABLED_STRATEGIES", "S1,S2,S3,S4").split(",")
@@ -22,15 +24,29 @@ class Config:
 
     # Risk / management (pips). TP1 is always exactly 1 executed R and the
     # ordinary runner is 2R; stale .env TP values cannot desynchronise them.
-    SL_MAX_PIPS: float = float(os.getenv("SL_MAX_PIPS", "20"))
-    TP1_PIPS: float = SL_MAX_PIPS
-    TP2_PIPS: float = 2 * SL_MAX_PIPS
+    SL_CAP_PIPS: float = float(os.getenv("SL_CAP_PIPS", os.getenv("SL_MAX_PIPS", "20")))
+    SL_MAX_PIPS: float = SL_CAP_PIPS  # backward-compatible alias
+    TP_FINAL_R: float = float(os.getenv("TP_FINAL_R", "2.0"))
+    TP1_PIPS: float = SL_CAP_PIPS
+    TP2_PIPS: float = TP_FINAL_R * SL_CAP_PIPS
     SL_BUFFER_PIPS: float = float(os.getenv("SL_BUFFER_PIPS", "2"))
     PARTIAL_CLOSE_PCT: float = float(os.getenv("PARTIAL_CLOSE_PCT", "50"))
-    TIMEOUT_MINUTES: int = int(os.getenv("TIMEOUT_MINUTES", "45"))
+    TRADE_MAX_AGE_MINUTES: int = int(os.getenv(
+        "TRADE_MAX_AGE_MINUTES", os.getenv("TIMEOUT_MINUTES", "60")
+    ))
+    TIMEOUT_MINUTES: int = TRADE_MAX_AGE_MINUTES
     COOLDOWN_MINUTES: int = int(os.getenv("COOLDOWN_MINUTES", "10"))
     PENDING_ORDER_EXPIRY_MIN: int = int(os.getenv("PENDING_ORDER_EXPIRY_MIN", "15"))
     MAX_SPREAD_PIPS: float = float(os.getenv("MAX_SPREAD_PIPS", "4.0"))
+    BE_COST_BUFFER_PIPS: float = float(os.getenv("BE_COST_BUFFER_PIPS", "8.0"))
+    TRAIL_MODE: str = os.getenv("TRAIL_MODE", "structure").lower()
+    ATR_MULT: float = float(os.getenv("ATR_MULT", "1.5"))
+    TRAIL_ATR_PERIOD: int = int(os.getenv("TRAIL_ATR_PERIOD", "14"))
+    TRAIL_SWING_LOOKBACK: int = int(os.getenv("TRAIL_SWING_LOOKBACK", "2"))
+    TRAIL_BUFFER_PIPS: float = float(os.getenv("TRAIL_BUFFER_PIPS", "2.0"))
+    # XAUUSD (100 oz contract): one 0.01 pip at one lot is approximately $1.
+    # Keep configurable for broker-specific contract metadata.
+    PIP_VALUE_PER_LOT_USD: float = float(os.getenv("PIP_VALUE_PER_LOT_USD", "1.0"))
 
     # News tagging
     FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
@@ -83,6 +99,11 @@ class Config:
     S4_REQUIRE_FVG_OR_OB: bool = os.getenv("S4_REQUIRE_FVG_OR_OB", "false").lower() == "true"
     S4_SL_BUFFER_PIPS: float = float(os.getenv("S4_SL_BUFFER_PIPS", "2"))
     S4_PULLBACK_TOLERANCE_PIPS: float = float(os.getenv("S4_PULLBACK_TOLERANCE_PIPS", "5"))
+
+    # Scan-stats observability (SPEC E)
+    SCAN_STATS_LOG_EVERY: int = int(os.getenv("SCAN_STATS_LOG_EVERY", "120"))
+    SCAN_STATS_PERSIST: bool = os.getenv("SCAN_STATS_PERSIST", "true").lower() == "true"
+    SCAN_STATS_TOP_N: int = int(os.getenv("SCAN_STATS_TOP_N", "5"))
 
     # Friday flat: force-close all positions this many minutes before market close
     FRIDAY_FLAT_UTC: str = os.getenv("FRIDAY_FLAT_UTC", "21:50")

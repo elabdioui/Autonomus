@@ -60,7 +60,7 @@ def _vol_regime_now() -> str:
 
 
 def _execution_levels(signal: Signal) -> tuple[float, float, float] | None:
-    """Return entry reference, fixed 20-pip SL and valid TP for execution."""
+    """Return live entry, fixed 20-pip SL and SPEC E final target."""
     if signal.entry_type == "MARKET":
         tick = mt5_client.get_tick()
         if tick is None:
@@ -72,13 +72,26 @@ def _execution_levels(signal: Signal) -> tuple[float, float, float] | None:
             entry = tick.ask if signal.direction == "LONG" else tick.bid
     else:
         entry = signal.entry_price
-    risk = cfg.SL_MAX_PIPS * cfg.PIP
+    risk = cfg.SL_CAP_PIPS * cfg.PIP
+    is_s3 = (signal.setup or "").lower() == "s3_mean_reversion"
     if signal.direction == "LONG":
         sl = entry - risk
-        tp = signal.tp2 if signal.tp2 > entry else entry + cfg.TP2_PIPS * cfg.PIP
+        if is_s3:
+            if signal.tp_final <= entry:
+                log.error("Invalid S3 EMA target: entry=%.3f ema=%.3f", entry, signal.tp_final)
+                return None
+            tp = signal.tp_final
+        else:
+            tp = entry + cfg.TP_FINAL_R * risk
     else:
         sl = entry + risk
-        tp = signal.tp2 if signal.tp2 < entry else entry - cfg.TP2_PIPS * cfg.PIP
+        if is_s3:
+            if signal.tp_final >= entry:
+                log.error("Invalid S3 EMA target: entry=%.3f ema=%.3f", entry, signal.tp_final)
+                return None
+            tp = signal.tp_final
+        else:
+            tp = entry - cfg.TP_FINAL_R * risk
     return round(entry, cfg.DIGITS), round(sl, cfg.DIGITS), round(tp, cfg.DIGITS)
 
 
@@ -146,7 +159,7 @@ def try_execute(signal: Signal) -> None:
     if signal.entry_type == "MARKET":
         result = mt5_client.place_market(
             direction=signal.direction,
-            lot=cfg.LOT,
+            lot=cfg.LOT_SIZE,
             sl=execution_sl,
             tp=execution_tp,
             magic=magic,
@@ -157,7 +170,7 @@ def try_execute(signal: Signal) -> None:
         result = mt5_client.place_limit(
             direction=signal.direction,
             price=execution_entry,
-            lot=cfg.LOT,
+            lot=cfg.LOT_SIZE,
             sl=execution_sl,
             tp=execution_tp,
             magic=magic,
@@ -184,7 +197,7 @@ def try_execute(signal: Signal) -> None:
         mt5_ticket=result.ticket,
         strategy=signal.strategy,
         direction=signal.direction,
-        lot=cfg.LOT,
+        lot=cfg.LOT_SIZE,
         entry_price_fill=fill_price,
         entry_ts_utc=now_utc,
         sl_initial=execution_sl,
@@ -192,6 +205,16 @@ def try_execute(signal: Signal) -> None:
         tp1=execution_tp1,
         tp2=execution_tp,
         status=status,
+        setup=signal.setup or signal.strategy,
+        magic=magic,
+        lifecycle_state="OPEN" if status == "OPEN" else "PENDING",
+        sl_executed=execution_sl,
+        tp_final=execution_tp,
+        killzone=signal.killzone,
+        htf_bias=str(signal.context.get("htf_bias", "NEUTRAL")),
+        bias_aligned=bool(signal.context.get("bias_aligned", False)),
+        news_red_active=str(signal.context.get("news_red_active", "unknown")).lower(),
+        premium_discount=str(signal.context.get("premium_discount", "EQ")),
         news_flag=news_flag,
         vol_regime=vol_regime,
         spread_at_entry_pips=spread,
@@ -211,6 +234,8 @@ def try_execute(signal: Signal) -> None:
         "news_known": news_known,
         "sl_structural_pips": signal.sl_pips,
         "sl_executed_pips": cfg.SL_MAX_PIPS,
+        "setup": signal.setup or signal.strategy,
+        "tp_final": execution_tp,
         "would_block_position": would_block_position,
         "would_block_cooldown": would_block_cooldown,
         "would_block_news": news_flag,

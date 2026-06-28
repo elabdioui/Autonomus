@@ -180,6 +180,24 @@ def _recent_signals_html(limit: int = 20) -> str:
     return _table(cols, data)
 
 
+def _scan_stats_html() -> str:
+    rows = _store.get_scan_stats()
+    if not rows:
+        return '<p class="gray">No scan rejections recorded yet.</p>'
+    cols = ["Strategy", "Direction", "Reason", "Count", "Last seen"]
+    data = [
+        [
+            r["strategy"],
+            r["direction"],
+            r["reason"],
+            r["count"],
+            (r["last_seen_utc"] or "")[:19],
+        ]
+        for r in rows
+    ]
+    return _table(cols, data)
+
+
 def _full_html() -> str:
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -204,6 +222,9 @@ def _full_html() -> str:
 
 <h2>Last 20 Signals</h2>
 {_recent_signals_html()}
+
+<h2>Scan Rejections</h2>
+{_scan_stats_html()}
 
 <p class="gray" style="margin-top:40px;font-size:11px">Auto-refresh 30 s &mdash; DEMO ONLY &mdash; no live capital</p>
 </body></html>"""
@@ -230,6 +251,12 @@ async def api_summary():
             "exits": st.exits,
         }
     return JSONResponse(result)
+
+
+@app.get("/api/scan_stats")
+async def api_scan_stats():
+    from core.store import get_scan_stats
+    return get_scan_stats()
 
 
 @app.get("/api/trades")

@@ -21,6 +21,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 import mt5_client
 from config import cfg
 from core.models import Signal
+from core.scan_stats import stats
 from core.sessions import get_killzone_tag
 from core.store import init_db, insert_signal, upsert_heartbeat
 from execution.engine import try_execute, reconcile_pending_and_orphans
@@ -51,13 +52,14 @@ _ALL_STRATEGIES = [S1, S2, S3, S4]
 _connection_state = True
 _reconnect_failures = 0
 _next_reconnect_at = 0.0
+_scan_count = 0
 
 
 
 
 # ── Scan job ──────────────────────────────────────────────────────────────────
 def scan_once() -> None:
-    global _connection_state, _reconnect_failures, _next_reconnect_at
+    global _connection_state, _reconnect_failures, _next_reconnect_at, _scan_count
     if not mt5_client.is_connected():
         if _connection_state:
             log.warning("MT5 state: connected -> disconnected")
@@ -130,6 +132,11 @@ def scan_once() -> None:
                      strat.name, direction, sig.entry_price, sig.sl_pips, sig.score)
             try_execute(sig)
 
+    _scan_count += 1
+    if cfg.SCAN_STATS_LOG_EVERY > 0 and _scan_count % cfg.SCAN_STATS_LOG_EVERY == 0:
+        stats.log_summary()
+        stats.flush_to_db()
+
 
 # ── Test signal injection ─────────────────────────────────────────────────────
 def _inject_test_signal() -> None:
@@ -185,6 +192,7 @@ def main() -> None:
              cfg.SYMBOL, cfg.LOT, [setup.name for setup in _ALL_STRATEGIES])
 
     init_db()
+    stats.load_from_db()
     mt5_client.connect()
     start_news_updater()
 
@@ -203,6 +211,7 @@ def main() -> None:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutting down")
+        stats.flush_to_db()
         mt5_client.disconnect()
 
 

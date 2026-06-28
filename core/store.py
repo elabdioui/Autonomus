@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_ts_utc TEXT,
     sl_initial REAL, sl_current REAL, tp1 REAL, tp2 REAL,
     status TEXT NOT NULL,
+    setup TEXT,
+    magic INTEGER,
+    lifecycle_state TEXT,
+    sl_executed REAL,
+    tp_final REAL,
+    killzone TEXT,
+    htf_bias TEXT,
+    bias_aligned INTEGER DEFAULT 0,
+    news_red_active TEXT,
+    premium_discount TEXT,
     exit_reason TEXT,
     exit_ts_utc TEXT,
     pnl_pips REAL, pnl_usd REAL,
@@ -52,7 +62,12 @@ CREATE TABLE IF NOT EXISTS trades (
     commission_usd REAL DEFAULT 0,
     swap_usd REAL DEFAULT 0,
     pnl_gross_usd REAL,
-    pnl_net_usd REAL
+    pnl_net_usd REAL,
+    tp1_hit INTEGER DEFAULT 0,
+    partial_close_price REAL,
+    realized_r REAL,
+    realized_r_net REAL,
+    duration_s INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS trade_events (
@@ -68,6 +83,16 @@ CREATE TABLE IF NOT EXISTS heartbeat (
     ts_utc TEXT NOT NULL,
     open_positions INTEGER,
     last_scan_killzone TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scan_stats (
+    strategy TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    first_seen_utc TEXT,
+    last_seen_utc TEXT,
+    PRIMARY KEY (strategy, direction, reason)
 );
 """
 
@@ -98,6 +123,21 @@ def init_db() -> None:
             "ALTER TABLE trades ADD COLUMN swap_usd REAL DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN pnl_gross_usd REAL",
             "ALTER TABLE trades ADD COLUMN pnl_net_usd REAL",
+            "ALTER TABLE trades ADD COLUMN setup TEXT",
+            "ALTER TABLE trades ADD COLUMN magic INTEGER",
+            "ALTER TABLE trades ADD COLUMN lifecycle_state TEXT",
+            "ALTER TABLE trades ADD COLUMN sl_executed REAL",
+            "ALTER TABLE trades ADD COLUMN tp_final REAL",
+            "ALTER TABLE trades ADD COLUMN killzone TEXT",
+            "ALTER TABLE trades ADD COLUMN htf_bias TEXT",
+            "ALTER TABLE trades ADD COLUMN bias_aligned INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN news_red_active TEXT",
+            "ALTER TABLE trades ADD COLUMN premium_discount TEXT",
+            "ALTER TABLE trades ADD COLUMN tp1_hit INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN partial_close_price REAL",
+            "ALTER TABLE trades ADD COLUMN realized_r REAL",
+            "ALTER TABLE trades ADD COLUMN realized_r_net REAL",
+            "ALTER TABLE trades ADD COLUMN duration_s INTEGER",
         ):
             try:
                 con.execute(stmt)
@@ -138,21 +178,27 @@ def insert_trade(trade: TradeRecord) -> None:
             """INSERT OR IGNORE INTO trades
                (trade_id, signal_id, mt5_ticket, strategy, direction, lot,
                 entry_price_fill, entry_ts_utc, sl_initial, sl_current, tp1, tp2,
-                status, exit_reason, exit_ts_utc, pnl_pips, pnl_usd,
+                status, setup, magic, lifecycle_state, sl_executed, tp_final,
+                killzone, htf_bias, bias_aligned, news_red_active, premium_discount,
+                exit_reason, exit_ts_utc, pnl_pips, pnl_usd,
                 mae_pips, mfe_pips, news_flag, vol_regime, spread_at_entry_pips,
                 be_target, be_retries, sl_structural_pips,
                 would_block_position, would_block_cooldown, would_block_news,
                 would_block_spread, commission_usd, swap_usd,
-                pnl_gross_usd, pnl_net_usd)
+                pnl_gross_usd, pnl_net_usd, tp1_hit, partial_close_price,
+                realized_r, realized_r_net, duration_s)
                VALUES
                (:trade_id,:signal_id,:mt5_ticket,:strategy,:direction,:lot,
                 :entry_price_fill,:entry_ts_utc,:sl_initial,:sl_current,:tp1,:tp2,
-                :status,:exit_reason,:exit_ts_utc,:pnl_pips,:pnl_usd,
+                :status,:setup,:magic,:lifecycle_state,:sl_executed,:tp_final,
+                :killzone,:htf_bias,:bias_aligned,:news_red_active,:premium_discount,
+                :exit_reason,:exit_ts_utc,:pnl_pips,:pnl_usd,
                 :mae_pips,:mfe_pips,:news_flag,:vol_regime,:spread_at_entry_pips,
                 :be_target,:be_retries,:sl_structural_pips,
                 :would_block_position,:would_block_cooldown,:would_block_news,
                 :would_block_spread,:commission_usd,:swap_usd,
-                :pnl_gross_usd,:pnl_net_usd)""",
+                :pnl_gross_usd,:pnl_net_usd,:tp1_hit,:partial_close_price,
+                :realized_r,:realized_r_net,:duration_s)""",
             row,
         )
 
@@ -191,6 +237,33 @@ def upsert_heartbeat(open_positions: int, last_scan_killzone: str | None) -> Non
                  last_scan_killzone=excluded.last_scan_killzone""",
             (datetime.now(timezone.utc).isoformat(), open_positions, last_scan_killzone),
         )
+
+
+def upsert_scan_stat(strategy: str, direction: str, reason: str,
+                     count: int, last_seen_utc: str) -> None:
+    """REPLACE-semantics upsert: set count = :count, never add a delta."""
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO scan_stats (strategy, direction, reason, count,
+                                    first_seen_utc, last_seen_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(strategy, direction, reason) DO UPDATE SET
+                count = excluded.count,
+                last_seen_utc = excluded.last_seen_utc
+            """,
+            (strategy, direction, reason, count, last_seen_utc, last_seen_utc),
+        )
+
+
+def get_scan_stats() -> list[dict]:
+    """All scan-stat rows, highest count first. Used by the dashboard."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT strategy, direction, reason, count, first_seen_utc, last_seen_utc "
+            "FROM scan_stats ORDER BY count DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_open_trades() -> list[TradeRecord]:
